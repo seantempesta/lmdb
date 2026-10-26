@@ -465,6 +465,32 @@ typedef struct mdb_mutex {
 	semop((mutex)->semid, &sb, 1); \
 } while(0)
 
+/** The semaphores of an env's SysV set: 0 the reader lock, 1 the writer lock,
+ *	#MDB_SEM_USERS the count of processes using the set (each counted with
+ *	SEM_UNDO, so the kernel takes back a dead process's count), and two values
+ *	from #MDB_SEM_ID on naming the lock file the set belongs to.
+ *
+ *	The set is found by ftok() of the lock file, which keeps only 16 bits of
+ *	the inode, so two envs can share a key. A set is taken only while nobody
+ *	uses it, so two envs never share one: sharing let one env's open reset the
+ *	other's writer lock, and its last close remove the other's set.
+ */
+enum { MDB_SEM_USERS = 2, MDB_SEM_ID = 3, MDB_SEM_N = 5 };
+
+/** EINVAL from a semop with SEM_UNDO on set \b semid: the set is gone, or
+ *	it exists and this process has no undo entry left (kern.sysv.semume),
+ *	#MDB_SEM_UNDO_FULL.
+ */
+static int
+mdb_sem_einval(int semid)
+{
+	struct semid_ds buf;
+	union semun semu;
+	semu.buf = &buf;
+	return !semctl(semid, 0, IPC_STAT, semu) && buf.sem_nsems >= MDB_SEM_N
+		? MDB_SEM_UNDO_FULL : EINVAL;
+}
+
 static int
 mdb_sem_wait(mdb_mutexref_t sem)
 {
@@ -478,7 +504,7 @@ mdb_sem_wait(mdb_mutexref_t sem)
 			break;
 		}
 	} while ((rc = errno) == EINTR);
-	return rc;
+	return rc == EINVAL ? mdb_sem_einval(sem->semid) : rc;
 }
 
 #define mdb_mutex_consistent(mutex)	0
@@ -979,7 +1005,7 @@ typedef struct MDB_txninfo {
 #elif defined MDB_USE_POSIX_SEM
 # define MDB_LOCK_TYPE	(4 + ALIGNOF2(mdb_hash_t)/8 % 2)
 #elif defined MDB_USE_SYSV_SEM
-# define MDB_LOCK_TYPE	(8)
+# define MDB_LOCK_TYPE	(9)	/* 9: five semaphores a set, MDB_SEM_N */
 #elif defined MDB_USE_POSIX_MUTEX
 /* We do not know the inside of a POSIX mutex and how to check if mutexes
  * used by two executables are compatible. Just check alignment and size.
@@ -1936,6 +1962,7 @@ static char *const mdb_errstr[] = {
 	"MDB_ENV_BUSY: Environment is busy, can't use previous snapshot",
 	"MDB_IS_READONLY: Can't write in readonly txn or environment",
 	"MDB_ADDR_BUSY: Requested map address is unavailable",
+	"MDB_SEM_UNDO_FULL: SysV semaphore undo entries of this process full (kern.sysv.semume)",
 };
 
 char *
@@ -5946,6 +5973,100 @@ mdb_env_mname_init(MDB_env *env)
 
 #endif
 
+#ifdef MDB_USE_SYSV_SEM
+/** The lock file's identity, as two values a semaphore holds (0..32767). */
+static int ESECT
+mdb_sem_ident(MDB_env *env, int id[2])
+{
+	struct stat st;
+	uint64_t h;
+	if (fstat(env->me_lfd, &st))
+		return ErrCode();
+	h = ((uint64_t)st.st_ino ^ ((uint64_t)st.st_dev << 40)) * 0x9E3779B97F4A7C15ULL;
+	id[0] = (h >> 34) & 0x7fff;
+	id[1] = (h >> 49) & 0x7fff;
+	return MDB_SUCCESS;
+}
+
+/** Count this process as a user of set \b semid. With \b vacant, only if the
+ *	count is zero, in the same semop, so two openers never both take one
+ *	unused set. Returns 0; EAGAIN when the set is in use (vacant only);
+ *	#MDB_SEM_UNDO_FULL when the set exists and this process has no undo
+ *	entry left (kern.sysv.semume); otherwise the errno, EINVAL or EIDRM
+ *	when the set is gone or not of this layout.
+ */
+static int ESECT
+mdb_sem_join(int semid, int vacant)
+{
+	struct sembuf sb[2] = {
+		{ MDB_SEM_USERS, 0, IPC_NOWAIT },
+		{ MDB_SEM_USERS, 1, SEM_UNDO|IPC_NOWAIT } };
+	int rc;
+	while ((rc = semop(semid, sb + !vacant, 1 + !!vacant)) &&
+			(rc = ErrCode()) == EINTR) ;
+	return rc == EINVAL ? mdb_sem_einval(semid) : rc;
+}
+
+/** Stop counting this process as a user of set \b semid. */
+static void ESECT
+mdb_sem_leave(int semid)
+{
+	struct sembuf sb = { MDB_SEM_USERS, -1, SEM_UNDO|IPC_NOWAIT };
+	semop(semid, &sb, 1);
+}
+
+/** Does set \b semid name lock file \b id? */
+static int ESECT
+mdb_sem_ours(int semid, int id[2])
+{
+	return semctl(semid, MDB_SEM_ID, GETVAL) == id[0] &&
+		semctl(semid, MDB_SEM_ID+1, GETVAL) == id[1];
+}
+
+/** Take a set nobody uses, from the lock file's key on: a set in use, or of
+ *	another layout, is another env's, so the next key is tried. The set is
+ *	taken with this process counted, its locks free and \b id in it.
+ */
+static int ESECT
+mdb_sem_take(MDB_name *fname, int mode, int id[2], int *semid)
+{
+	union semun semu;
+	key_t key = ftok(fname->mn_val, 'M'); /* fname is lockfile path now */
+	int i, s, rc;
+	if (key == -1)
+		return ErrCode();
+	for (i = 0; i <= 0xffff; i++, key = (key & ~0xffff) | ((key + 1) & 0xffff)) {
+		s = semget(key, MDB_SEM_N, (mode & 0777) | IPC_CREAT);
+		if (s < 0) {
+			if ((rc = ErrCode()) == EINVAL)
+				continue;
+			return rc;
+		}
+		rc = mdb_sem_join(s, 1);
+		if (rc == EAGAIN || rc == EINVAL || rc == EIDRM)
+			continue;
+		if (rc)
+			return rc;
+		semu.val = 1;
+		if (semctl(s, 0, SETVAL, semu) < 0 || semctl(s, 1, SETVAL, semu) < 0)
+			goto fail;
+		semu.val = id[0];
+		if (semctl(s, MDB_SEM_ID, SETVAL, semu) < 0)
+			goto fail;
+		semu.val = id[1];
+		if (semctl(s, MDB_SEM_ID+1, SETVAL, semu) < 0)
+			goto fail;
+		*semid = s;
+		return MDB_SUCCESS;
+fail:
+		rc = ErrCode();
+		mdb_sem_leave(s);
+		return rc;
+	}
+	return ENOSPC;	/* every key's set is in use */
+}
+#endif	/* MDB_USE_SYSV_SEM */
+
 /** Open and/or initialize the lock region for the environment.
  * @param[in] env The LMDB environment.
  * @param[in] fname Filename + scratch area, from #mdb_fname_init().
@@ -5962,7 +6083,7 @@ mdb_env_setup_locks(MDB_env *env, MDB_name *fname, int mode, int *excl)
 #	define MDB_ERRCODE_ROFS	EROFS
 #endif
 #ifdef MDB_USE_SYSV_SEM
-	int semid;
+	int semid, id[2];
 	union semun semu;
 #endif
 	int rc;
@@ -6094,16 +6215,9 @@ mdb_env_setup_locks(MDB_env *env, MDB_name *fname, int mode, int *excl)
 		env->me_wmutex = sem_open(MUTEXNAME(env, 'w'), O_CREAT|O_EXCL, mode, 1);
 		if (env->me_wmutex == SEM_FAILED) goto fail_errno;
 #elif defined(MDB_USE_SYSV_SEM)
-		unsigned short vals[2] = {1, 1};
-		key_t key = ftok(fname->mn_val, 'M'); /* fname is lockfile path now */
-		if (key == -1)
-			goto fail_errno;
-		semid = semget(key, 2, (mode & 0777) | IPC_CREAT);
-		if (semid < 0)
-			goto fail_errno;
-		semu.array = vals;
-		if (semctl(semid, 0, SETALL, semu) < 0)
-			goto fail_errno;
+		if ((rc = mdb_sem_ident(env, id)) ||
+			(rc = mdb_sem_take(fname, mode, id, &semid)))
+			goto fail;
 		env->me_txns->mti_semid = semid;
 		env->me_txns->mti_rlocked = 0;
 		env->me_txns->mti_wlocked = 0;
@@ -6163,7 +6277,33 @@ mdb_env_setup_locks(MDB_env *env, MDB_name *fname, int mode, int *excl)
 		env->me_wmutex = sem_open(MUTEXNAME(env, 'w'), 0);
 		if (env->me_wmutex == SEM_FAILED) goto fail_errno;
 #elif defined(MDB_USE_SYSV_SEM)
-		semid = env->me_txns->mti_semid;
+		if ((rc = mdb_sem_ident(env, id)))
+			goto fail;
+		for (;;) {
+			int s;
+			semid = env->me_txns->mti_semid;
+			if (semid != -1) {
+				rc = mdb_sem_join(semid, 0);
+				if (!rc && mdb_sem_ours(semid, id))
+					break;
+				if (!rc)
+					mdb_sem_leave(semid);
+				else if (rc != EINVAL && rc != EIDRM)
+					goto fail;
+			}
+			/* The set is gone: its last user removed it (a close that ran
+			 * while this process waited for the lock file), or it is not
+			 * ours. Take a new one and publish it in the lock file, unless
+			 * another process waiting with us published one first.
+			 */
+			if ((rc = mdb_sem_take(fname, mode, id, &s)))
+				goto fail;
+			if (__sync_bool_compare_and_swap(&env->me_txns->mti_semid, semid, s)) {
+				semid = s;
+				break;
+			}
+			semctl(s, 0, IPC_RMID);
+		}
 		semu.buf = &buf;
 		/* check for read access */
 		if (semctl(semid, 0, IPC_STAT, semu) < 0)
@@ -6563,14 +6703,20 @@ mdb_env_close_active(MDB_env *env, int excl)
 			}
 		}
 #elif defined(MDB_USE_SYSV_SEM)
-		if (env->me_rmutex->semid != -1) {
+		if (env->me_rmutex->semid != -1 && env->me_pid == getpid()) {
 			/* If we have the filelock:  If we are the
-			 * only remaining user, clean up semaphores.
+			 * only remaining user, clean up semaphores,
+			 * and say so in the lock file for a process
+			 * already waiting for the lock. Else stop
+			 * counting as a user of the set.
 			 */
 			if (excl == 0)
 				mdb_env_excl_lock(env, &excl);
-			if (excl > 0)
+			if (excl > 0) {
+				env->me_txns->mti_semid = -1;
 				semctl(env->me_rmutex->semid, 0, IPC_RMID);
+			} else
+				mdb_sem_leave(env->me_rmutex->semid);
 		}
 #endif
 		munmap((void *)env->me_txns, (env->me_maxreaders-1)*sizeof(MDB_reader)+sizeof(MDB_txninfo));

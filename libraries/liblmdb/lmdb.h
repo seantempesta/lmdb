@@ -540,8 +540,10 @@ typedef enum MDB_cursor_op {
 #define MDB_IS_READONLY	(-30770)
 	/** Requested map address is unavailable */
 #define MDB_ADDR_BUSY	(-30769)
+	/** SysV semaphore undo entries of this process full (kern.sysv.semume) */
+#define MDB_SEM_UNDO_FULL	(-30768)
 	/** The last defined error code */
-#define MDB_LAST_ERRCODE	MDB_ADDR_BUSY
+#define MDB_LAST_ERRCODE	MDB_SEM_UNDO_FULL
 /** @} */
 
 /** @brief Statistics for a database in the environment */
