@@ -6038,7 +6038,12 @@ again:
 			return rc;
 		}
 		semu.buf = &buf;
-		if (semctl(s, 0, IPC_STAT, semu) < 0 || buf.sem_nsems != MDB_SEM_N)
+		if (semctl(s, 0, IPC_STAT, semu) < 0) {
+			if (gone++ < 8)
+				goto again;	/* removed under us: this key again */
+			continue;
+		}
+		if (buf.sem_nsems != MDB_SEM_N)
 			continue;
 		while ((rc = semop(s, claim, 5)) && (rc = ErrCode()) == EINTR) ;
 		if (!rc) {
@@ -6047,8 +6052,8 @@ again:
 		}
 		if ((rc == EINVAL || rc == EIDRM) && gone++ < 8)
 			goto again;	/* removed under us (its last user's close): this key again */
-		if (rc == EINVAL || rc == EIDRM || rc == EACCES)
-			continue;
+		if (rc == EINVAL || rc == EIDRM || rc == EACCES || rc == ERANGE)
+			continue;	/* another user's, or a foreign set whose locks are past their range */
 		if (rc != EAGAIN)
 			return rc;
 		if (!mdb_sem_ours(s, id))
@@ -6062,6 +6067,8 @@ again:
 		return MDB_SUCCESS;
 	}
 	return ENOSPC;	/* every key's set is another lock file's */
+	/* A foreign set of four semaphores whose third is zero is taken as new:
+	 * nothing but its layout and identity says whose a set is. */
 }
 #endif	/* MDB_USE_SYSV_SEM */
 
@@ -6217,6 +6224,12 @@ mdb_env_setup_locks(MDB_env *env, MDB_name *fname, int mode, int *excl)
 		if ((rc = mdb_sem_ident(env, id, &key)) ||
 			(rc = mdb_sem_take(key, mode, id, 1, &semid)))
 			goto fail;
+		/* the set a dead last user published, when it is ours at a later key
+		 * than the one taken now (its key's set was another's then): nobody
+		 * else will remove it */
+		if (env->me_txns->mti_semid != semid && env->me_txns->mti_semid > 0 &&
+			mdb_sem_ours(env->me_txns->mti_semid, id))
+			semctl(env->me_txns->mti_semid, 0, IPC_RMID);
 		env->me_txns->mti_semid = semid;
 		env->me_txns->mti_rlocked = 0;
 		env->me_txns->mti_wlocked = 0;
@@ -6295,6 +6308,10 @@ mdb_env_setup_locks(MDB_env *env, MDB_name *fname, int mode, int *excl)
 				semid = s;
 				break;
 			}
+			/* another joiner published first: a set of ours it did not publish
+			 * is used by nobody (it was never in the lock file) */
+			if (env->me_txns->mti_semid != s)
+				semctl(s, 0, IPC_RMID);
 		}
 		semu.buf = &buf;
 		/* check for read access, then for write access */
@@ -6704,8 +6721,16 @@ mdb_env_close_active(MDB_env *env, int excl)
 			if (excl == 0)
 				mdb_env_excl_lock(env, &excl);
 			if (excl > 0) {
+				/* and the set the lock file names now, when it is ours and
+				 * not the one this process opened with (a joiner published it
+				 * after this process's set was removed under it) */
+				int pub = env->me_txns->mti_semid, id[2];
+				key_t key;
 				env->me_txns->mti_semid = -1;
 				semctl(env->me_rmutex->semid, 0, IPC_RMID);
+				if (pub > 0 && pub != env->me_rmutex->semid &&
+					!mdb_sem_ident(env, id, &key) && mdb_sem_ours(pub, id))
+					semctl(pub, 0, IPC_RMID);
 			}
 		}
 #endif
