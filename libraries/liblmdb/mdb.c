@@ -466,17 +466,21 @@ typedef struct mdb_mutex {
 } while(0)
 
 /** The semaphores of an env's SysV set: 0 the reader lock, 1 the writer lock,
- *	#MDB_SEM_USERS the count of processes using the set (each counted with
- *	SEM_UNDO, so the kernel takes back a dead process's count), #MDB_SEM_INIT
- *	nonzero while a process is taking the set (a joiner does not join it then),
- *	and two values from #MDB_SEM_ID on naming the lock file the set belongs to.
+ *	and two values from #MDB_SEM_ID on naming the lock file the set belongs to
+ *	(a hash of its inode and device, 1..32767 each).
  *
- *	The set is found by ftok() of the lock file, which keeps only 16 bits of
- *	the inode, so two envs can share a key. A set is taken only while nobody
- *	uses it, so two envs never share one: sharing let one env's open reset the
- *	other's writer lock, and its last close remove the other's set.
+ *	The set's key comes from the same hash (#mdb_sem_ident), not from ftok(),
+ *	which keeps only 16 bits of the inode: two envs whose keys meet anyway
+ *	find the other's identity in the set and take the next key, so they never
+ *	share one (sharing let one env's open reset the other's writer lock, and
+ *	its last close remove the other's set). A process holds a SEM_UNDO entry
+ *	only while it holds a lock, never for the env's life: the kernel gives a
+ *	process few (kern.sysv.semume, 10 on macOS). The last user is the one that
+ *	gets the lock file's exclusive lock at its close, as for POSIX semaphores,
+ *	and it removes the set; a set a dead last user left is taken again by the
+ *	next first opener of its env, at the same key.
  */
-enum { MDB_SEM_USERS = 2, MDB_SEM_INIT = 3, MDB_SEM_ID = 4, MDB_SEM_N = 6 };
+enum { MDB_SEM_ID = 2, MDB_SEM_N = 4 };
 
 /** EINVAL from a semop with SEM_UNDO on set \b semid: the set is gone, or
  *	it exists and this process has no undo entry left (kern.sysv.semume),
@@ -1006,7 +1010,7 @@ typedef struct MDB_txninfo {
 #elif defined MDB_USE_POSIX_SEM
 # define MDB_LOCK_TYPE	(4 + ALIGNOF2(mdb_hash_t)/8 % 2)
 #elif defined MDB_USE_SYSV_SEM
-# define MDB_LOCK_TYPE	(9)	/* 9: six semaphores a set, MDB_SEM_N */
+# define MDB_LOCK_TYPE	(7)	/* 7: four semaphores a set (MDB_SEM_N), keyed by the lock file's identity */
 #elif defined MDB_USE_POSIX_MUTEX
 /* We do not know the inside of a POSIX mutex and how to check if mutexes
  * used by two executables are compatible. Just check alignment and size.
@@ -5975,51 +5979,22 @@ mdb_env_mname_init(MDB_env *env)
 #endif
 
 #ifdef MDB_USE_SYSV_SEM
-/** The lock file's identity, as two values a semaphore holds (0..32767). */
+/** The lock file's identity, as two values a semaphore holds (1..32767), and
+ *	the key its set is first looked for at, all from one hash of its inode and
+ *	device.
+ */
 static int ESECT
-mdb_sem_ident(MDB_env *env, int id[2])
+mdb_sem_ident(MDB_env *env, int id[2], key_t *key)
 {
 	struct stat st;
 	uint64_t h;
 	if (fstat(env->me_lfd, &st))
 		return ErrCode();
 	h = ((uint64_t)st.st_ino ^ ((uint64_t)st.st_dev << 40)) * 0x9E3779B97F4A7C15ULL;
-	id[0] = (h >> 34) & 0x7fff;
-	id[1] = (h >> 49) & 0x7fff;
+	id[0] = 1 + (int)((h >> 34) % 32767);
+	id[1] = 1 + (int)((h >> 49) % 32767);
+	*key = (key_t)((h & 0x7fffffff) | 1);	/* positive, never IPC_PRIVATE */
 	return MDB_SUCCESS;
-}
-
-/** Count this process as a user of set \b semid. With \b vacant, only if the
- *	count is zero, in the same semop, so two openers never both take one
- *	unused set, and mark the set being taken (#MDB_SEM_INIT); without, only if
- *	no process is taking it. Returns 0; EAGAIN when the set is in use or being
- *	taken;
- *	#MDB_SEM_UNDO_FULL when the set exists and this process has no undo
- *	entry left (kern.sysv.semume); otherwise the errno, EINVAL or EIDRM
- *	when the set is gone or not of this layout.
- */
-static int ESECT
-mdb_sem_join(int semid, int vacant)
-{
-	struct sembuf take[3] = {
-		{ MDB_SEM_USERS, 0, IPC_NOWAIT },
-		{ MDB_SEM_USERS, 1, SEM_UNDO|IPC_NOWAIT },
-		{ MDB_SEM_INIT, 1, SEM_UNDO|IPC_NOWAIT } };
-	struct sembuf join[2] = {
-		{ MDB_SEM_INIT, 0, IPC_NOWAIT },
-		{ MDB_SEM_USERS, 1, SEM_UNDO|IPC_NOWAIT } };
-	int rc;
-	while ((rc = vacant ? semop(semid, take, 3) : semop(semid, join, 2)) &&
-			(rc = ErrCode()) == EINTR) ;
-	return rc == EINVAL ? mdb_sem_einval(semid) : rc;
-}
-
-/** Stop counting this process as a user of set \b semid. */
-static void ESECT
-mdb_sem_leave(int semid)
-{
-	struct sembuf sb = { MDB_SEM_USERS, -1, SEM_UNDO|IPC_NOWAIT };
-	semop(semid, &sb, 1);
 }
 
 /** Does set \b semid name lock file \b id? */
@@ -6030,53 +6005,63 @@ mdb_sem_ours(int semid, int id[2])
 		semctl(semid, MDB_SEM_ID+1, GETVAL) == id[1];
 }
 
-/** Take a set nobody uses, from the lock file's key on: a set in use, or of
- *	another layout, is another env's, so the next key is tried. The set is
- *	taken with this process counted, its locks free and \b id in it; a joiner
- *	waits for none of it, as #MDB_SEM_INIT holds joiners off until \b id is in.
+/** The set of lock file \b id, from \b key on: a new set is claimed in one
+ *	semop (its identity written and its locks made free together, only while
+ *	it names no lock file, so two openers never both claim one), a set naming
+ *	this lock file is the one to use, and a set naming another, or of another
+ *	layout, is passed over. With \b reset (the first opener, holding the lock
+ *	file exclusively, so no process uses the set) a set found already naming
+ *	this lock file has its locks made free: one its dead last user left.
+ *	No SEM_UNDO: nothing here is the process's to give back.
  */
 static int ESECT
-mdb_sem_take(MDB_name *fname, int mode, int id[2], int *semid)
+mdb_sem_take(key_t key, int mode, int id[2], int reset, int *semid)
 {
-	struct sembuf done = { MDB_SEM_INIT, -1, SEM_UNDO|IPC_NOWAIT };
+	/* five operations, macOS's most in one semop (SEMOPM, 5); the two
+	 * identity values are only ever written together, here, so the first
+	 * being zero says the set names no lock file */
+	struct sembuf claim[5] = {
+		{ MDB_SEM_ID, 0, IPC_NOWAIT },
+		{ MDB_SEM_ID, 0, IPC_NOWAIT }, { MDB_SEM_ID+1, 0, IPC_NOWAIT },
+		{ 0, 1, IPC_NOWAIT }, { 1, 1, IPC_NOWAIT } };
 	struct semid_ds buf;
 	union semun semu;
-	key_t key = ftok(fname->mn_val, 'M'); /* fname is lockfile path now */
-	int i, s, rc;
-	if (key == -1)
-		return ErrCode();
-	for (i = 0; i <= 0xffff; i++, key = (key & ~0xffff) | ((key + 1) & 0xffff)) {
+	int i, s, rc, gone = 0;
+	claim[1].sem_op = id[0];
+	claim[2].sem_op = id[1];
+	for (i = 0; i <= 0xffff; i++, key = (key_t)(((key + 2) & 0x7fffffff) | 1)) {
+again:
 		s = semget(key, MDB_SEM_N, (mode & 0777) | IPC_CREAT);
 		if (s < 0) {
-			if ((rc = ErrCode()) == EINVAL)
-				continue;
+			if ((rc = ErrCode()) == EINVAL || rc == EACCES)
+				continue;	/* a set of another size, or another user's, at this key */
 			return rc;
 		}
 		semu.buf = &buf;
 		if (semctl(s, 0, IPC_STAT, semu) < 0 || buf.sem_nsems != MDB_SEM_N)
-			continue;	/* gone, or a bigger set of someone else's */
-		rc = mdb_sem_join(s, 1);
-		if (rc == EAGAIN || rc == EINVAL || rc == EIDRM)
 			continue;
-		if (rc)
+		while ((rc = semop(s, claim, 5)) && (rc = ErrCode()) == EINTR) ;
+		if (!rc) {
+			*semid = s;
+			return MDB_SUCCESS;
+		}
+		if ((rc == EINVAL || rc == EIDRM) && gone++ < 8)
+			goto again;	/* removed under us (its last user's close): this key again */
+		if (rc == EINVAL || rc == EIDRM || rc == EACCES)
+			continue;
+		if (rc != EAGAIN)
 			return rc;
-		semu.val = 1;
-		if (semctl(s, 0, SETVAL, semu) < 0 || semctl(s, 1, SETVAL, semu) < 0)
-			goto fail;
-		semu.val = id[0];
-		if (semctl(s, MDB_SEM_ID, SETVAL, semu) < 0)
-			goto fail;
-		semu.val = id[1];
-		if (semctl(s, MDB_SEM_ID+1, SETVAL, semu) < 0 || semop(s, &done, 1) < 0)
-			goto fail;
+		if (!mdb_sem_ours(s, id))
+			continue;	/* another lock file's */
+		if (reset) {
+			semu.val = 1;
+			if (semctl(s, 0, SETVAL, semu) < 0 || semctl(s, 1, SETVAL, semu) < 0)
+				return ErrCode();
+		}
 		*semid = s;
 		return MDB_SUCCESS;
-fail:
-		rc = ErrCode();
-		semctl(s, 0, IPC_RMID);	/* ours alone: nobody else counts on it */
-		return rc;
 	}
-	return ENOSPC;	/* every key's set is in use */
+	return ENOSPC;	/* every key's set is another lock file's */
 }
 #endif	/* MDB_USE_SYSV_SEM */
 
@@ -6097,6 +6082,7 @@ mdb_env_setup_locks(MDB_env *env, MDB_name *fname, int mode, int *excl)
 #endif
 #ifdef MDB_USE_SYSV_SEM
 	int semid, id[2];
+	key_t key;
 	union semun semu;
 #endif
 	int rc;
@@ -6228,8 +6214,8 @@ mdb_env_setup_locks(MDB_env *env, MDB_name *fname, int mode, int *excl)
 		env->me_wmutex = sem_open(MUTEXNAME(env, 'w'), O_CREAT|O_EXCL, mode, 1);
 		if (env->me_wmutex == SEM_FAILED) goto fail_errno;
 #elif defined(MDB_USE_SYSV_SEM)
-		if ((rc = mdb_sem_ident(env, id)) ||
-			(rc = mdb_sem_take(fname, mode, id, &semid)))
+		if ((rc = mdb_sem_ident(env, id, &key)) ||
+			(rc = mdb_sem_take(key, mode, id, 1, &semid)))
 			goto fail;
 		env->me_txns->mti_semid = semid;
 		env->me_txns->mti_rlocked = 0;
@@ -6290,39 +6276,31 @@ mdb_env_setup_locks(MDB_env *env, MDB_name *fname, int mode, int *excl)
 		env->me_wmutex = sem_open(MUTEXNAME(env, 'w'), 0);
 		if (env->me_wmutex == SEM_FAILED) goto fail_errno;
 #elif defined(MDB_USE_SYSV_SEM)
-		if ((rc = mdb_sem_ident(env, id)))
+		if ((rc = mdb_sem_ident(env, id, &key)))
 			goto fail;
 		for (;;) {
 			int s;
 			semid = env->me_txns->mti_semid;
-			if (semid != -1) {
-				rc = mdb_sem_join(semid, 0);
-				if (!rc && mdb_sem_ours(semid, id))
-					break;
-				if (!rc)
-					mdb_sem_leave(semid);
-				else if (rc != EAGAIN && rc != EINVAL && rc != EIDRM)
-					goto fail;
-			}
+			if (semid != -1 && mdb_sem_ours(semid, id))
+				break;
 			/* The set is gone: its last user removed it (a close that ran
 			 * while this process waited for the lock file), or it is not
-			 * ours. Take a new one and publish it in the lock file, unless
-			 * another process waiting with us published one first.
+			 * ours. Take this lock file's set and publish it in the lock
+			 * file, unless another process waiting with us published one
+			 * first (the same set: it is found by the same key).
 			 */
-			if ((rc = mdb_sem_take(fname, mode, id, &s)))
+			if ((rc = mdb_sem_take(key, mode, id, 0, &s)))
 				goto fail;
 			if (__sync_bool_compare_and_swap(&env->me_txns->mti_semid, semid, s)) {
 				semid = s;
 				break;
 			}
-			semctl(s, 0, IPC_RMID);
 		}
 		semu.buf = &buf;
 		/* check for read access, then for write access */
 		if (semctl(semid, 0, IPC_STAT, semu) < 0 ||
 			semctl(semid, 0, IPC_SET, semu) < 0) {
 			rc = ErrCode();
-			mdb_sem_leave(semid);
 			goto fail;
 		}
 #endif
@@ -6721,16 +6699,14 @@ mdb_env_close_active(MDB_env *env, int excl)
 			/* If we have the filelock:  If we are the
 			 * only remaining user, clean up semaphores,
 			 * and say so in the lock file for a process
-			 * already waiting for the lock. Else stop
-			 * counting as a user of the set.
+			 * already waiting for the lock.
 			 */
 			if (excl == 0)
 				mdb_env_excl_lock(env, &excl);
 			if (excl > 0) {
 				env->me_txns->mti_semid = -1;
 				semctl(env->me_rmutex->semid, 0, IPC_RMID);
-			} else
-				mdb_sem_leave(env->me_rmutex->semid);
+			}
 		}
 #endif
 		munmap((void *)env->me_txns, (env->me_maxreaders-1)*sizeof(MDB_reader)+sizeof(MDB_txninfo));
