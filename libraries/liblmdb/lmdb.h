@@ -901,6 +901,31 @@ int  mdb_env_sync(MDB_env *env, int force);
 	 */
 void mdb_env_close(MDB_env *env);
 
+	/** @brief Release the locks of an environment no process has open.
+	 *
+	 * This is what the last close of the environment does, for one whose last
+	 * user exited without closing it (it was killed, or never called
+	 * #mdb_env_close()): with SysV semaphores (MDB_USE_ROBUST on macOS) such a
+	 * user leaves the environment's semaphore set, which only the next open of
+	 * the environment takes again. Call it before deleting an environment's
+	 * files, so the set does not outlive them. It takes the lock file's
+	 * exclusive lock without waiting, as the last close does, so it changes
+	 * nothing while another process has the environment open. It must not be
+	 * called by a process that has the environment open itself: the lock file's
+	 * locks are the process's, so its own would be released.
+	 * @param[in] path The path given to #mdb_env_open().
+	 * @param[in] flags #MDB_NOSUBDIR if the environment was opened with it,
+	 * otherwise 0.
+	 * @return A non-zero error value on failure and 0 on success, when there is
+	 * no lock file included. Some possible errors are:
+	 * <ul>
+	 *	<li>EBUSY - another process has the environment open.
+	 *	<li>#MDB_INVALID - the lock file is not an LMDB lock file.
+	 *	<li>#MDB_VERSION_MISMATCH - the lock file is of another lock format.
+	 * </ul>
+	 */
+int  mdb_env_release_locks(const char *path, unsigned int flags);
+
 	/** @brief Set environment flags.
 	 *
 	 * This may be used to set some flags in addition to those from

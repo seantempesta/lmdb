@@ -5979,16 +5979,16 @@ mdb_env_mname_init(MDB_env *env)
 #endif
 
 #ifdef MDB_USE_SYSV_SEM
-/** The lock file's identity, as two values a semaphore holds (1..32767), and
- *	the key its set is first looked for at, all from one hash of its inode and
- *	device.
+/** The identity of lock file \b lfd, as two values a semaphore holds
+ *	(1..32767), and the key its set is first looked for at, all from one hash
+ *	of its inode and device.
  */
 static int ESECT
-mdb_sem_ident(MDB_env *env, int id[2], key_t *key)
+mdb_sem_ident(HANDLE lfd, int id[2], key_t *key)
 {
 	struct stat st;
 	uint64_t h;
-	if (fstat(env->me_lfd, &st))
+	if (fstat(lfd, &st))
 		return ErrCode();
 	h = ((uint64_t)st.st_ino ^ ((uint64_t)st.st_dev << 40)) * 0x9E3779B97F4A7C15ULL;
 	id[0] = 1 + (int)((h >> 34) % 32767);
@@ -6221,7 +6221,7 @@ mdb_env_setup_locks(MDB_env *env, MDB_name *fname, int mode, int *excl)
 		env->me_wmutex = sem_open(MUTEXNAME(env, 'w'), O_CREAT|O_EXCL, mode, 1);
 		if (env->me_wmutex == SEM_FAILED) goto fail_errno;
 #elif defined(MDB_USE_SYSV_SEM)
-		if ((rc = mdb_sem_ident(env, id, &key)) ||
+		if ((rc = mdb_sem_ident(env->me_lfd, id, &key)) ||
 			(rc = mdb_sem_take(key, mode, id, 1, &semid)))
 			goto fail;
 		/* the set a dead last user published, when it is ours at a later key
@@ -6289,7 +6289,7 @@ mdb_env_setup_locks(MDB_env *env, MDB_name *fname, int mode, int *excl)
 		env->me_wmutex = sem_open(MUTEXNAME(env, 'w'), 0);
 		if (env->me_wmutex == SEM_FAILED) goto fail_errno;
 #elif defined(MDB_USE_SYSV_SEM)
-		if ((rc = mdb_sem_ident(env, id, &key)))
+		if ((rc = mdb_sem_ident(env->me_lfd, id, &key)))
 			goto fail;
 		for (;;) {
 			int s;
@@ -6729,7 +6729,7 @@ mdb_env_close_active(MDB_env *env, int excl)
 				env->me_txns->mti_semid = -1;
 				semctl(env->me_rmutex->semid, 0, IPC_RMID);
 				if (pub > 0 && pub != env->me_rmutex->semid &&
-					!mdb_sem_ident(env, id, &key) && mdb_sem_ours(pub, id))
+					!mdb_sem_ident(env->me_lfd, id, &key) && mdb_sem_ours(pub, id))
 					semctl(pub, 0, IPC_RMID);
 			}
 		}
@@ -6783,6 +6783,88 @@ mdb_env_close(MDB_env *env)
 	free(env->me_enckey.mv_data);
 #endif
 	free(env);
+}
+
+int ESECT
+mdb_env_release_locks(const char *path, unsigned int flags)
+{
+#ifdef MDB_USE_SYSV_SEM
+	char *lname;
+	MDB_txninfo *ti;
+	struct flock lock_info;
+	MDB_OFF_T size;
+	key_t key;
+	int rc, fd, semid, id[2], i;
+
+	if (flags & MDB_NOLOCK)
+		return MDB_SUCCESS;
+	flags &= MDB_NOSUBDIR;
+	if ((lname = malloc(strlen(path) + MDB_SUFFLEN+1)) == NULL)
+		return ENOMEM;
+	strcpy(lname, path);
+	strcat(lname, mdb_suffixes[1][flags != 0]);
+	fd = open(lname, O_RDWR|MDB_CLOEXEC);
+	free(lname);
+	if (fd == INVALID_HANDLE_VALUE)
+		return (rc = ErrCode()) == ENOENT ? MDB_SUCCESS : rc;
+
+	/* The exclusive lock, never waited for: every process with the
+	 * environment open holds the lock file shared. */
+	memset((void *)&lock_info, 0, sizeof(lock_info));
+	lock_info.l_type = F_WRLCK;
+	lock_info.l_whence = SEEK_SET;
+	lock_info.l_start = 0;
+	lock_info.l_len = 1;
+	while ((rc = fcntl(fd, F_SETLK, &lock_info)) &&
+			(rc = ErrCode()) == EINTR) ;
+	if (rc) {
+		if (rc == EAGAIN || rc == EACCES)
+			rc = EBUSY;
+		goto leave;
+	}
+	size = lseek(fd, 0, SEEK_END);
+	if (size == -1) {
+		rc = ErrCode();
+		goto leave;
+	}
+	if (size < (MDB_OFF_T)sizeof(MDB_txninfo))
+		goto leave;	/* never set up: no set */
+	ti = mmap(NULL, sizeof(MDB_txninfo), PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+	if (ti == MAP_FAILED) {
+		rc = ErrCode();
+		goto leave;
+	}
+	if (ti->mti_magic != MDB_MAGIC)
+		rc = MDB_INVALID;
+	else if (ti->mti_format != MDB_LOCK_FORMAT)
+		rc = MDB_VERSION_MISMATCH;
+	else if (!(rc = mdb_sem_ident(fd, id, &key))) {
+		/* the set the lock file names, and any set of this lock file from
+		 * its key on (one a joiner took and never published): a set is
+		 * taken at the first key with no set, so none lies past it */
+		semid = ti->mti_semid;
+		ti->mti_semid = -1;
+		if (semid > 0 && mdb_sem_ours(semid, id))
+			semctl(semid, 0, IPC_RMID);
+		for (i = 0; i <= 0xffff; i++, key = (key_t)(((key + 2) & 0x7fffffff) | 1)) {
+			if ((semid = semget(key, 0, 0)) < 0) {
+				if (ErrCode() == ENOENT)
+					break;
+				continue;	/* another user's */
+			}
+			if (mdb_sem_ours(semid, id))
+				semctl(semid, 0, IPC_RMID);
+		}
+	}
+	munmap((void *)ti, sizeof(MDB_txninfo));
+leave:
+	(void) close(fd);
+	return rc;
+#else
+	(void) path;
+	(void) flags;
+	return MDB_SUCCESS;
+#endif
 }
 
 /** Compare two items pointing at aligned #mdb_size_t's */
