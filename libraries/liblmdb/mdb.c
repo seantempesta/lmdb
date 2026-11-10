@@ -103,6 +103,9 @@ static NtCloseFunc *NtClose;
 #define MDB_PID_T	pid_t
 #define MDB_THR_T	pthread_t
 #include <sys/param.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>	/* kern.boottime, mdb_boot_id() */
+#endif
 #include <sys/uio.h>
 #include <sys/mman.h>
 #ifdef HAVE_SYS_FILE_H
@@ -488,7 +491,7 @@ mdb_sem_wait(mdb_mutexref_t sem)
 
 #elif defined MDB_USE_FCNTL
 	/** The locks a lock file carries (#MDB_FCNTL_NLOCKS: the reader
-	 *	table lock, the writer lock), each a mutex of this process and an
+	 *	table lock, the writer lock, the sync lock), each a mutex of this process and an
 	 *	open-file-description record lock (F_OFD_SETLKW) on one byte of
 	 *	the lock file, at #MDB_FCNTL_LOCKS on, through a description of
 	 *	its own (#MDB_lockfile.%mf_lfd).
@@ -514,7 +517,7 @@ mdb_sem_wait(mdb_mutexref_t sem)
 	 *	its parent's it would share the locks its parent holds.
 	 */
 	/** How many locks a lock file carries */
-#define MDB_FCNTL_NLOCKS	2
+#define MDB_FCNTL_NLOCKS	3
 
 typedef struct MDB_lockfile {
 	struct MDB_lockfile *mf_next;	/**< the next lock file of this process */
@@ -524,7 +527,7 @@ typedef struct MDB_lockfile {
 	int			mf_refs;	/**< how many envs use it */
 	int			mf_nspare;	/**< how many descriptors in #mf_spare */
 	int			*mf_spare;	/**< descriptors closed only with #mf_fd */
-	pthread_mutex_t	mf_mutex[MDB_FCNTL_NLOCKS];	/**< reader table lock, writer lock */
+	pthread_mutex_t	mf_mutex[MDB_FCNTL_NLOCKS];	/**< reader table lock, writer lock, sync lock */
 	int			mf_lfd[MDB_FCNTL_NLOCKS];	/**< the descriptions the locks are taken through */
 	int			mf_shared;	/**< this process holds the lock file's byte 0 */
 	char		*mf_path;	/**< the lock file's path, to open it again in a child */
@@ -537,7 +540,7 @@ typedef struct MDB_lockfile {
 
 typedef struct mdb_mutex {
 	MDB_lockfile	*lf;	/**< the lock file, its descriptor and mutexes */
-	int		num;		/**< 0 the reader table lock, 1 the writer lock */
+	int		num;		/**< 0 the reader table lock, 1 the writer lock, 2 the sync lock */
 	int		*locked;	/**< set while held, to tell a dead holder */
 } mdb_mutex_t[1], *mdb_mutexref_t;
 
@@ -692,6 +695,18 @@ static int mdb_mutex_failed(MDB_env *env, mdb_mutexref_t mutex, int rc);
 # define MDB_FDATASYNC	fdatasync
 #endif
 
+/** Function ordering the writes of a file made before it before those
+ *	made after it, on the disk, without waiting for them to reach it.
+ *	Where there is none, a flush: #MDB_FDATASYNC.
+ */
+#ifndef MDB_BARRIER
+# ifdef F_BARRIERFSYNC
+#  define MDB_BARRIER(fd)	fcntl(fd, F_BARRIERFSYNC)
+# else
+#  define MDB_BARRIER(fd)	MDB_FDATASYNC(fd)
+# endif
+#endif
+
 #ifndef MDB_MSYNC
 # define MDB_MSYNC(addr,len,flags)	msync(addr,len,flags)
 #endif
@@ -801,7 +816,7 @@ static txnid_t mdb_debug_start;
 	/**	The version number for a database's datafile format. */
 #define MDB_DATA_VERSION	 ((MDB_DEVEL) ? 999 : 3)
 	/**	The version number for a database's lockfile format. */
-#define MDB_LOCK_VERSION	 ((MDB_DEVEL) ? 999 : 2)
+#define MDB_LOCK_VERSION	 ((MDB_DEVEL) ? 999 : 3)	/* 3: #MDB_txbody.%mtb_steady */
 	/** Number of bits representing #MDB_LOCK_VERSION in #MDB_LOCK_FORMAT.
 	 *	The remaining bits must leave room for #MDB_lock_desc.
 	 */
@@ -1034,12 +1049,23 @@ typedef struct MDB_txbody {
 #elif defined(MDB_USE_FCNTL)
 		/** Set while the reader table lock is held */
 	int		mtb_rlocked;
+		/** Set while the sync lock (#mdb_env_steady()) is held */
+	int		mtb_slocked;
 #else
 		/** Mutex protecting access to this table.
 		 *	This is the reader table lock used with LOCK_MUTEX().
 		 */
 	mdb_mutex_t	mtb_rmutex;
 #endif
+		/** Nonzero when the environment keeps a steady snapshot
+		 *	(#MDB_SAFENOSYNC): every writer of it then does.
+		 */
+	uint32_t	mtb_safenosync;
+		/** The steady snapshot: the last txn #mdb_env_sync() made
+		 *	durable under #MDB_SAFENOSYNC, 0 if none. Pages it uses are
+		 *	not reused, as for a reader at it (#mdb_find_oldest()).
+		 */
+	volatile txnid_t	mtb_steady;
 } MDB_txbody;
 
 	/** The actual reader table definition. */
@@ -1051,12 +1077,17 @@ typedef struct MDB_txninfo {
 #define mti_rmutex	mt1.mtb.mtb_rmutex
 #define mti_txnid	mt1.mtb.mtb_txnid
 #define mti_numreaders	mt1.mtb.mtb_numreaders
+#define mti_safenosync	mt1.mtb.mtb_safenosync
+#define mti_steady	mt1.mtb.mtb_steady
 #define mti_mutexid	mt1.mtb.mtb_mutexid
 #ifdef MDB_USE_SYSV_SEM
 #define	mti_semid	mt1.mtb.mtb_semid
 #endif
 #if defined(MDB_USE_SYSV_SEM) || defined(MDB_USE_FCNTL)
 #define	mti_rlocked	mt1.mtb.mtb_rlocked
+#endif
+#ifdef MDB_USE_FCNTL
+#define	mti_slocked	mt1.mtb.mtb_slocked
 #endif
 		char pad[(sizeof(MDB_txbody)+CACHELINE-1) & ~(CACHELINE-1)];
 	} mt1;
@@ -1799,6 +1830,10 @@ struct MDB_env {
 	unsigned int	me_maxreaders;	/**< size of the reader table */
 	/** Max #MDB_txninfo.%mti_numreaders of interest to #mdb_env_close() */
 	volatile int	me_close_readers;
+	/** The steady snapshot when there is no lock region (#MDB_NOLOCK),
+	 *	as #MDB_txbody.%mtb_steady
+	 */
+	txnid_t		me_steady;
 	MDB_dbi		me_numdbs;		/**< number of DBs opened */
 	MDB_dbi		me_maxdbs;		/**< size of the DB table */
 	MDB_PID_T	me_pid;		/**< process ID of this env */
@@ -1848,6 +1883,9 @@ struct MDB_env {
 #else
 	mdb_mutex_t	me_rmutex;
 	mdb_mutex_t	me_wmutex;
+# ifdef MDB_USE_FCNTL
+	mdb_mutex_t	me_smutex;	/**< the sync lock, #mdb_env_steady() */
+# endif
 # if defined(_WIN32) || defined(MDB_USE_POSIX_SEM)
 	/** Half-initialized name of mutexes, to be completed by #MUTEXNAME() */
 	char		me_mutexname[sizeof(MUTEXNAME_PREFIX) + 11];
@@ -2048,6 +2086,7 @@ static char *const mdb_errstr[] = {
 	"MDB_ENV_BUSY: Environment is busy, can't use previous snapshot",
 	"MDB_IS_READONLY: Can't write in readonly txn or environment",
 	"MDB_ADDR_BUSY: Requested map address is unavailable",
+	"MDB_UNSETTLED: Environment needs a writable exclusive open after a system crash",
 };
 
 char *
@@ -2800,6 +2839,10 @@ mdb_find_oldest(MDB_txn *txn)
 	} while (pid && pid != env->me_pid && check-- &&
 		!mdb_reader_pid(env, Pidcheck, pid) &&
 		!mdb_reader_check0(env, 0, NULL));
+	/* The steady snapshot (#MDB_SAFENOSYNC) is held as a reader would be */
+	mr = env->me_txns ? env->me_txns->mti_steady : env->me_steady;
+	if (mr && oldest > mr)
+		oldest = mr;
 	return oldest;
 }
 
@@ -3260,7 +3303,7 @@ mdb_env_sync0(MDB_env *env, int force, pgno_t numpgs)
 	int rc = 0;
 	if (env->me_flags & MDB_RDONLY)
 		return MDB_IS_READONLY;
-	if (force || (!(env->me_flags & MDB_NOSYNC)
+	if (force || (!(env->me_flags & (MDB_NOSYNC|MDB_SAFENOSYNC))
 #if defined(_WIN32) && MDB_USE_WRITE_THROUGH	/* Sync is normally achieved in Windows by doing WRITE_THROUGH writes */
 		&& (env->me_flags & MDB_WRITEMAP)
 #endif
@@ -3288,10 +3331,303 @@ mdb_env_sync0(MDB_env *env, int force, pgno_t numpgs)
 	return rc;
 }
 
+#ifndef _WIN32
+	/** A record of a steady snapshot (#MDB_SAFENOSYNC), kept in the
+	 *	unused tail of a meta page: #MDB_MARK_OFF bytes into meta page
+	 *	\b mk_seq & 1, so a mark being written never overwrites the
+	 *	newest one, which stays whole and durable.
+	 */
+typedef struct MDB_mark {
+	uint32_t	mk_magic;	/**< #MDB_MARK_MAGIC */
+	uint32_t	mk_version;	/**< #MDB_DATA_VERSION */
+	uint64_t	mk_seq;		/**< a newer mark has a higher number */
+	uint64_t	mk_boot[2];	/**< the OS boot it was written in, #mdb_boot_id() */
+	MDB_meta	mk_meta;	/**< the steady snapshot's meta, as a commit wrote it */
+	uint64_t	mk_sum;		/**< #mdb_mark_sum() of the bytes before it */
+} MDB_mark;
+
+#define MDB_MARK_MAGIC	0xBEEF57ADU
+	/** Where a mark lies in a meta page: clear of #MDB_meta, and of a
+	 *	checksum at the end of the page (#MDB_RPAGE_CACHE).
+	 */
+#define MDB_MARK_OFF(psize)	((psize) - 512)
+	/** The smallest page size a mark fits in */
+#define MDB_MARK_MINPAGE	1024
+
+	/** 64 bit FNV-1a of a mark's bytes before #MDB_mark.%mk_sum */
+static uint64_t ESECT
+mdb_mark_sum(const MDB_mark *mk)
+{
+	const unsigned char *p = (const unsigned char *)mk;
+	size_t n = offsetof(MDB_mark, mk_sum);
+	uint64_t h = 0xcbf29ce484222325ULL;
+	while (n--) {
+		h ^= *p++;
+		h *= 0x100000001b3ULL;
+	}
+	return h;
+}
+
+#ifdef MDB_BOOT_ID
+	/* A test's boot identity, named by -DMDB_BOOT_ID=function */
+int MDB_BOOT_ID(uint64_t boot[2]);
+#define mdb_boot_id	MDB_BOOT_ID
+#else
+	/** This OS boot's identity in \b boot. Returns 0 where it cannot be
+	 *	read: a mark is then taken to be from another boot.
+	 */
+static int ESECT
+mdb_boot_id(uint64_t boot[2])
+{
+#if defined(__APPLE__)
+	struct timeval tv;
+	size_t len = sizeof(tv);
+	int mib[2] = { CTL_KERN, KERN_BOOTTIME };
+	if (sysctl(mib, 2, &tv, &len, NULL, 0) || len != sizeof(tv) || !tv.tv_sec)
+		return 0;
+	boot[0] = (uint64_t)tv.tv_sec;
+	boot[1] = (uint64_t)tv.tv_usec;
+	return 1;
+#elif defined(__linux__)
+	char buf[64];
+	int fd, i, digits = 0;
+	ssize_t n;
+	if ((fd = open("/proc/sys/kernel/random/boot_id", O_RDONLY)) < 0)
+		return 0;
+	n = read(fd, buf, sizeof(buf));
+	close(fd);
+	boot[0] = boot[1] = 0;
+	for (i = 0; i < n && digits < 32; i++) {
+		int c = buf[i], v;
+		if (c >= '0' && c <= '9') v = c - '0';
+		else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
+		else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
+		else continue;
+		boot[digits / 16] = (boot[digits / 16] << 4) | (uint64_t)v;
+		digits++;
+	}
+	return digits == 32;
+#else
+	(void) boot;
+	return 0;
+#endif
+}
+#endif	/* MDB_BOOT_ID */
+
+	/** Read the newest valid mark of a data file of page size \b psize
+	 *	into \b mark. Returns 0, or #MDB_NOTFOUND when it has none.
+	 */
+static int ESECT
+mdb_mark_newest(MDB_env *env, unsigned psize, MDB_mark *mark)
+{
+	MDB_mark mk[NUM_METAS];
+	int i, n = -1;
+	ssize_t r;
+	for (i = 0; i < NUM_METAS; i++) {
+		r = pread(env->me_fd, &mk[i], sizeof(MDB_mark),
+			(off_t)psize * i + MDB_MARK_OFF(psize));
+		if (r < 0)
+			return ErrCode();
+		if (r != sizeof(MDB_mark) || mk[i].mk_magic != MDB_MARK_MAGIC ||
+			mk[i].mk_version != MDB_DATA_VERSION ||
+			mk[i].mk_sum != mdb_mark_sum(&mk[i]))
+			continue;
+		if (n < 0 || mk[i].mk_seq > mk[n].mk_seq)
+			n = i;
+	}
+	if (n < 0)
+		return MDB_NOTFOUND;
+	*mark = mk[n];
+	return MDB_SUCCESS;
+}
+
+	/** Make the newest snapshot the steady one (#MDB_SAFENOSYNC):
+	 *	order every write so far before what follows (#MDB_BARRIER),
+	 *	write its mark over the older one, flush, and only then let
+	 *	the pages the last steady snapshot used be reused. A crash at
+	 *	any point leaves the older mark, whose pages are still held,
+	 *	or the new one, whose pages are on the disk.
+	 * @param[in] excl the caller has the environment to itself (it is
+	 *	opening it exclusively, or with #MDB_NOLOCK): no lock is taken.
+	 */
+static int ESECT
+mdb_env_steady(MDB_env *env, int excl)
+{
+	MDB_mark mark, old;
+	uint64_t boot[2];
+	unsigned psize = env->me_psize;
+	txnid_t txnid;
+	volatile txnid_t *steady = env->me_txns ? &env->me_txns->mti_steady : &env->me_steady;
+	int rc, lock = !excl && env->me_txns;
+	ssize_t r;
+
+	if (psize < MDB_MARK_MINPAGE)
+		return EINVAL;
+	memset(&mark, 0, sizeof(mark));
+	if (lock) {
+#ifdef MDB_USE_FCNTL
+		/* Steady points are made one at a time; commits go on meanwhile */
+		if ((rc = LOCK_MUTEX0(env->me_smutex)) && rc != MDB_OWNERDEAD)
+			return rc;
+		if (LOCK_MUTEX(rc, env, env->me_wmutex)) {
+			UNLOCK_MUTEX(env->me_smutex);
+			return rc;
+		}
+#else
+		/* The writer lock is the sync lock: commits wait for it */
+		if (LOCK_MUTEX(rc, env, env->me_wmutex))
+			return rc;
+#endif
+		txnid = env->me_txns->mti_txnid;
+	} else {
+		txnid = mdb_env_pick_meta(env)->mm_txnid;
+	}
+	/* Its meta, read whole: no writer runs */
+	r = pread(env->me_fd, &mark.mk_meta, sizeof(MDB_meta),
+		(off_t)psize * (txnid & 1) + PAGEHDRSZ);
+#ifdef MDB_USE_FCNTL
+	if (lock)
+		UNLOCK_MUTEX(env->me_wmutex);
+#endif
+	if (r != sizeof(MDB_meta)) {
+		rc = r < 0 ? ErrCode() : MDB_PROBLEM;
+		goto done;
+	}
+	if (mark.mk_meta.mm_txnid != txnid) {
+		rc = MDB_PROBLEM;
+		goto done;
+	}
+	rc = mdb_mark_newest(env, psize, &old);
+	if (rc && rc != MDB_NOTFOUND)
+		goto done;
+	if (!mdb_boot_id(boot)) {
+		rc = EINVAL;	/* a kill and a crash would look alike: #MDB_SAFENOSYNC */
+		goto done;
+	}
+	if (!rc && old.mk_meta.mm_txnid == txnid &&
+		old.mk_boot[0] == boot[0] && old.mk_boot[1] == boot[1]) {
+		*steady = txnid;	/* nothing new since the last steady point */
+		goto done;
+	}
+	mark.mk_magic = MDB_MARK_MAGIC;
+	mark.mk_version = MDB_DATA_VERSION;
+	mark.mk_seq = rc ? 1 : old.mk_seq + 1;
+	mark.mk_boot[0] = boot[0];
+	mark.mk_boot[1] = boot[1];
+	mark.mk_sum = mdb_mark_sum(&mark);
+	if (MDB_BARRIER(env->me_fd)) {
+		rc = ErrCode();
+		goto done;
+	}
+	r = pwrite(env->me_fd, &mark, sizeof(mark),
+		(off_t)psize * (mark.mk_seq & 1) + MDB_MARK_OFF(psize));
+	if (r != sizeof(mark)) {
+		rc = r < 0 ? ErrCode() : MDB_PROBLEM;
+		goto done;
+	}
+	if (MDB_FDATASYNC(env->me_fd)) {
+		rc = ErrCode();
+		goto done;
+	}
+	*steady = txnid;
+	rc = MDB_SUCCESS;
+done:
+	if (lock) {
+#ifdef MDB_USE_FCNTL
+		UNLOCK_MUTEX(env->me_smutex);
+#else
+		UNLOCK_MUTEX(env->me_wmutex);
+#endif
+	}
+	return rc;
+}
+
+	/** Is the data file unsettled: its newest mark (#MDB_SAFENOSYNC) was
+	 *	written before the OS last booted, and a newer snapshot is there?
+	 *	That snapshot's pages may never have reached the disk, while the
+	 *	mark's did and were held: nothing may read or write it until a
+	 *	writer that has it alone has rolled it back (#mdb_env_restore()).
+	 * @param[out] mark the newest mark; its mk_magic is 0 when there is none
+	 * @param[out] psizep the data file's page size
+	 * @return 0, or EINVAL for a file with marks where this OS's boot
+	 *	cannot be identified: a kill and a crash then look alike.
+	 */
+static int ESECT
+mdb_env_unsettled(MDB_env *env, MDB_mark *mark, unsigned *psizep, int *unsettled)
+{
+	MDB_metabuf pbuf;
+	MDB_meta *m = &pbuf.mb_metabuf.mm_meta;
+	txnid_t newest = 0;
+	uint64_t boot[2];
+	unsigned psize = 0;
+	ssize_t r;
+	int i, rc;
+
+	mark->mk_magic = 0;
+	*unsettled = 0;
+	for (i = 0; i < NUM_METAS; i++) {
+		r = pread(env->me_fd, &pbuf, sizeof(pbuf), (off_t)psize * i);
+		if (r < 0)
+			return ErrCode();
+		/* new, short or foreign: mdb_env_open2() judges it */
+		if (r != sizeof(pbuf) || !F_ISSET(pbuf.mb_page.mp_flags, P_META) ||
+			m->mm_magic != MDB_MAGIC || m->mm_version != MDB_DATA_VERSION)
+			return MDB_SUCCESS;
+		if (i == 0)
+			psize = m->mm_psize;
+		if (m->mm_txnid > newest)
+			newest = m->mm_txnid;
+	}
+	if (psize < MDB_MARK_MINPAGE)
+		return MDB_SUCCESS;
+	if ((rc = mdb_mark_newest(env, psize, mark))) {
+		mark->mk_magic = 0;
+		return rc == MDB_NOTFOUND ? MDB_SUCCESS : rc;
+	}
+	if (!mdb_boot_id(boot))
+		return EINVAL;
+	*psizep = psize;
+	*unsettled = mark->mk_meta.mm_txnid < newest &&
+		(mark->mk_boot[0] != boot[0] || mark->mk_boot[1] != boot[1]);
+	return MDB_SUCCESS;
+}
+
+	/** Before a writer that has the data file alone uses it: when it is
+	 *	unsettled (#mdb_env_unsettled()), write its newest mark's meta into
+	 *	both meta pages, and flush. The commits after the last sync are lost,
+	 *	the database is whole.
+	 * @param[out] mark the newest mark; its mk_magic is 0 when there is none
+	 */
+static int ESECT
+mdb_env_restore(MDB_env *env, MDB_mark *mark)
+{
+	unsigned psize = 0;
+	size_t off = offsetof(MDB_meta, mm_mapsize), len = sizeof(MDB_meta) - off;
+	ssize_t r;
+	int i, rc, unsettled;
+
+	if ((rc = mdb_env_unsettled(env, mark, &psize, &unsettled)) || !unsettled)
+		return rc;
+	DPRINTF(("rolling back to steady txn %"Yu, mark->mk_meta.mm_txnid));
+	for (i = 0; i < NUM_METAS; i++) {
+		r = pwrite(env->me_fd, (char *)&mark->mk_meta + off, len,
+			(off_t)psize * i + PAGEHDRSZ + off);
+		if (r != (ssize_t)len)
+			return r < 0 ? ErrCode() : MDB_PROBLEM;
+	}
+	return MDB_FDATASYNC(env->me_fd) ? ErrCode() : MDB_SUCCESS;
+}
+#endif	/* !_WIN32 */
+
 int
 mdb_env_sync(MDB_env *env, int force)
 {
-	MDB_meta *m = mdb_env_pick_meta(env);
+	MDB_meta *m;
+#ifndef _WIN32
+	if ((env->me_flags & (MDB_SAFENOSYNC|MDB_RDONLY)) == MDB_SAFENOSYNC)
+		return force ? mdb_env_steady(env, 0) : MDB_SUCCESS;
+#endif
+	m = mdb_env_pick_meta(env);
 	return mdb_env_sync0(env, force, m->mm_last_pg+1);
 }
 
@@ -5096,7 +5432,7 @@ mdb_env_write_meta(MDB_txn *txn)
 	 * (me_mfd goes to the same file as me_fd, but writing to it
 	 * also syncs to disk.  Avoids a separate fdatasync() call.)
 	 */
-	mfd = (flags & (MDB_NOSYNC|MDB_NOMETASYNC)) ? env->me_fd : env->me_mfd;
+	mfd = (flags & (MDB_NOSYNC|MDB_NOMETASYNC|MDB_SAFENOSYNC)) ? env->me_fd : env->me_mfd;
 #ifdef _WIN32
 	{
 		memset(&ov, 0, sizeof(ov));
@@ -6218,7 +6554,7 @@ mdb_lockfile_open(MDB_env *env, MDB_name *fname, int mode, int *excl)
 	mdb_lockfiles = lf;
 	lf->mf_refs = 1;
 	env->me_lfd = fd;
-	env->me_rmutex->lf = env->me_wmutex->lf = lf;
+	env->me_rmutex->lf = env->me_wmutex->lf = env->me_smutex->lf = lf;
 	if ((rc = mdb_env_excl_lock(env, excl)) == 0)
 		lf->mf_shared = 1;
 	return rc;
@@ -6239,7 +6575,7 @@ joined:
 	}
 	lf->mf_refs++;
 	env->me_lfd = lf->mf_fd;
-	env->me_rmutex->lf = env->me_wmutex->lf = lf;
+	env->me_rmutex->lf = env->me_wmutex->lf = env->me_smutex->lf = lf;
 	*excl = 0;
 	return MDB_SUCCESS;
 }
@@ -6286,7 +6622,7 @@ mdb_lockfile_close(MDB_env *env)
 		free(lf);
 	}
 	pthread_mutex_unlock(&mdb_lockfiles_mutex);
-	env->me_rmutex->lf = env->me_wmutex->lf = NULL;
+	env->me_rmutex->lf = env->me_wmutex->lf = env->me_smutex->lf = NULL;
 }
 #endif	/* MDB_USE_FCNTL */
 
@@ -6460,6 +6796,7 @@ mdb_env_setup_locks(MDB_env *env, MDB_name *fname, int mode, int *excl)
 #elif defined(MDB_USE_FCNTL)
 		env->me_txns->mti_rlocked = 0;
 		env->me_txns->mti_wlocked = 0;
+		env->me_txns->mti_slocked = 0;
 #else	/* MDB_USE_POSIX_MUTEX: */
 		pthread_mutexattr_t mattr;
 
@@ -6487,6 +6824,8 @@ mdb_env_setup_locks(MDB_env *env, MDB_name *fname, int mode, int *excl)
 		env->me_txns->mti_format = MDB_LOCK_FORMAT;
 		env->me_txns->mti_txnid = 0;
 		env->me_txns->mti_numreaders = 0;
+		env->me_txns->mti_safenosync = 0;
+		env->me_txns->mti_steady = 0;
 
 	} else {
 #ifdef MDB_USE_SYSV_SEM
@@ -6536,8 +6875,10 @@ mdb_env_setup_locks(MDB_env *env, MDB_name *fname, int mode, int *excl)
 #elif defined(MDB_USE_FCNTL)
 	env->me_rmutex->num = 0;
 	env->me_wmutex->num = 1;
+	env->me_smutex->num = 2;
 	env->me_rmutex->locked = &env->me_txns->mti_rlocked;
 	env->me_wmutex->locked = &env->me_txns->mti_wlocked;
+	env->me_smutex->locked = &env->me_txns->mti_slocked;
 #endif
 
 	return MDB_SUCCESS;
@@ -6614,7 +6955,8 @@ mdb_env_envflags(MDB_env *env)
 	 */
 #define	CHANGEABLE	(MDB_NOSYNC|MDB_NOMETASYNC|MDB_MAPASYNC|MDB_NOMEMINIT)
 #define	CHANGELESS	(MDB_FIXEDMAP|MDB_NOSUBDIR|MDB_RDONLY| \
-	MDB_WRITEMAP|MDB_NOTLS|MDB_NOLOCK|MDB_NORDAHEAD|MDB_PREVSNAPSHOT|MDB_REMAP_CHUNKS)
+	MDB_WRITEMAP|MDB_NOTLS|MDB_NOLOCK|MDB_NORDAHEAD|MDB_PREVSNAPSHOT|MDB_REMAP_CHUNKS| \
+	MDB_SAFENOSYNC)
 #define EXPOSED		(CHANGEABLE|CHANGELESS | MDB_ENCRYPT)
 
 #if VALID_FLAGS & PERSISTENT_FLAGS & EXPOSED
@@ -6627,6 +6969,15 @@ mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode
 	int rc, excl = -1;
 #ifdef MDB_USE_FCNTL
 	int lockfiles = 0;	/* holding #mdb_lockfiles_mutex */
+#endif
+#ifndef _WIN32
+	MDB_mark mark;	/* the newest steady snapshot's, #mdb_env_restore() */
+	uint64_t boot[2];
+	if ((flags & MDB_SAFENOSYNC) && !mdb_boot_id(boot))
+		return EINVAL;	/* a kill and a crash would look alike */
+#else
+	if (flags & MDB_SAFENOSYNC)
+		return EINVAL;
 #endif
 	MDB_name fname;
 
@@ -6756,6 +7107,31 @@ mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode
 			goto leave;
 	}
 
+#ifndef _WIN32
+	/* The first writer since every process closed it, or one that
+	 * manages its own locks: roll back to the steady snapshot if the
+	 * OS crashed since, and keep a steady snapshot if one is kept.
+	 */
+	if (!(flags & (MDB_RDONLY|MDB_PREVSNAPSHOT)) && (excl > 0 || (flags & MDB_NOLOCK))) {
+		if ((rc = mdb_env_restore(env, &mark)))
+			goto leave;
+	} else {
+		/* It cannot roll back: it may not use an unsettled file. A
+		 * process waiting for the lock file while the first writer
+		 * opens it finds it settled. */
+		unsigned psize;
+		int unsettled;
+		if ((rc = mdb_env_unsettled(env, &mark, &psize, &unsettled)))
+			goto leave;
+		if (unsettled) {
+			rc = MDB_UNSETTLED;
+			goto leave;
+		}
+	}
+	if (mark.mk_magic)
+		env->me_flags |= MDB_SAFENOSYNC;
+#endif
+
 	if ((rc = mdb_env_open2(env, flags & MDB_PREVSNAPSHOT)) == MDB_SUCCESS) {
 		/* Synchronous fd for meta writes. Needed even with
 		 * MDB_NOSYNC/MDB_NOMETASYNC, in case these get reset.
@@ -6771,6 +7147,27 @@ mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode
 				goto leave;
 		}
 		DPRINTF(("opened dbenv %p", (void *) env));
+#ifndef _WIN32
+		if (!(flags & (MDB_RDONLY|MDB_PREVSNAPSHOT))) {
+			MDB_txninfo *ti = env->me_txns;
+			int alone = excl > 0 || !ti;
+			if (!alone && ti->mti_safenosync)
+				env->me_flags |= MDB_SAFENOSYNC;	/* its writers keep one */
+			if ((env->me_flags & (MDB_SAFENOSYNC|MDB_WRITEMAP)) ==
+				(MDB_SAFENOSYNC|MDB_WRITEMAP)) {
+				rc = EINVAL;	/* a steady snapshot is kept without a writable map */
+				goto leave;
+			}
+			if (alone && mark.mk_magic)
+				*(ti ? &ti->mti_steady : &env->me_steady) = mark.mk_meta.mm_txnid;
+			if ((env->me_flags & MDB_SAFENOSYNC) && (alone || !ti->mti_safenosync)) {
+				if (ti)
+					ti->mti_safenosync = 1;
+				if ((rc = mdb_env_steady(env, alone)))
+					goto leave;
+			}
+		}
+#endif
 		if (excl > 0 && !(flags & MDB_PREVSNAPSHOT)) {
 			rc = mdb_env_share_locks(env, &excl);
 			if (rc)
@@ -12039,7 +12436,7 @@ mdb_env_copyfd0(MDB_env *env, HANDLE fd)
 	mdb_mutexref_t wmutex = NULL;
 	int rc;
 	mdb_size_t wsize, w3;
-	char *ptr;
+	char *ptr, *mbuf = NULL;
 #ifdef _WIN32
 	DWORD len;
 	SIZE_T w2;
@@ -12080,6 +12477,22 @@ mdb_env_copyfd0(MDB_env *env, HANDLE fd)
 
 	wsize = env->me_psize * NUM_METAS;
 	ptr = env->me_map;
+#ifndef _WIN32
+	/* The copy's meta pages carry no mark (#MDB_SAFENOSYNC): its steady
+	 * snapshot's pages are not held in the copy */
+	if (env->me_psize >= MDB_MARK_MINPAGE) {
+		if (!(mbuf = malloc(wsize))) {
+			rc = ENOMEM;
+			if (wmutex)
+				UNLOCK_MUTEX(wmutex);
+			goto leave;
+		}
+		memcpy(mbuf, ptr, wsize);
+		for (w3 = 0; w3 < NUM_METAS; w3++)
+			memset(mbuf + env->me_psize * w3 + MDB_MARK_OFF(env->me_psize), 0, sizeof(MDB_mark));
+		ptr = mbuf;
+	}
+#endif
 	w2 = wsize;
 	while (w2 > 0) {
 		DO_WRITE(rc, fd, ptr, w2, len);
@@ -12102,6 +12515,7 @@ mdb_env_copyfd0(MDB_env *env, HANDLE fd)
 
 	if (rc)
 		goto leave;
+	ptr = env->me_map + wsize;
 
 	w3 = txn->mt_next_pgno * env->me_psize;
 	{
@@ -12150,6 +12564,7 @@ mdb_env_copyfd0(MDB_env *env, HANDLE fd)
 	}
 
 leave:
+	free(mbuf);
 	_mdb_txn_abort(txn);
 	return rc;
 }
