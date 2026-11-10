@@ -193,8 +193,8 @@ typedef SSIZE_T	ssize_t;
 # if defined(__APPLE__) && !defined(MDB_USE_ROBUST)
 # define MDB_USE_POSIX_SEM	1
 # endif
-# if !(defined(MDB_USE_POSIX_MUTEX) || defined(MDB_USE_POSIX_SEM))
-# define MDB_USE_SYSV_SEM	1
+# if !(defined(MDB_USE_POSIX_MUTEX) || defined(MDB_USE_POSIX_SEM) || defined(MDB_USE_SYSV_SEM))
+# define MDB_USE_FCNTL	1
 # endif
 # if defined(__APPLE__)
 # define MDB_FDATASYNC(fd)		fcntl(fd, F_FULLFSYNC)
@@ -229,13 +229,13 @@ union semun {
 	unsigned short *array;
 };
 #endif /* _SEM_SEMUN_UNDEFINED */
-#else
+#elif !defined(MDB_USE_FCNTL)
 #define MDB_USE_POSIX_MUTEX	1
 #endif /* MDB_USE_POSIX_SEM */
 #endif /* !_WIN32 */
 
 #if defined(_WIN32) + defined(MDB_USE_POSIX_SEM) + defined(MDB_USE_SYSV_SEM) \
-	+ defined(MDB_USE_POSIX_MUTEX) != 1
+	+ defined(MDB_USE_FCNTL) + defined(MDB_USE_POSIX_MUTEX) != 1
 # error "Ambiguous shared-lock implementation"
 #endif
 
@@ -343,7 +343,7 @@ union semun {
 #define	MDB_NO_ROOT		(MDB_LAST_ERRCODE + 10)
 #ifdef _WIN32
 #define MDB_OWNERDEAD	((int) WAIT_ABANDONED)
-#elif defined MDB_USE_SYSV_SEM
+#elif defined(MDB_USE_SYSV_SEM) || defined(MDB_USE_FCNTL)
 #define MDB_OWNERDEAD	(MDB_LAST_ERRCODE + 11)
 #elif defined(MDB_USE_POSIX_MUTEX) && defined(EOWNERDEAD)
 #define MDB_OWNERDEAD	EOWNERDEAD	/**< #LOCK_MUTEX0() result if dead owner */
@@ -465,37 +465,6 @@ typedef struct mdb_mutex {
 	semop((mutex)->semid, &sb, 1); \
 } while(0)
 
-/** The semaphores of an env's SysV set: 0 the reader lock, 1 the writer lock,
- *	and two values from #MDB_SEM_ID on naming the lock file the set belongs to
- *	(a hash of its inode and device, 1..32767 each).
- *
- *	The set's key comes from the same hash (#mdb_sem_ident), not from ftok(),
- *	which keeps only 16 bits of the inode: two envs whose keys meet anyway
- *	find the other's identity in the set and take the next key, so they never
- *	share one (sharing let one env's open reset the other's writer lock, and
- *	its last close remove the other's set). A process holds a SEM_UNDO entry
- *	only while it holds a lock, never for the env's life: the kernel gives a
- *	process few (kern.sysv.semume, 10 on macOS). The last user is the one that
- *	gets the lock file's exclusive lock at its close, as for POSIX semaphores,
- *	and it removes the set; a set a dead last user left is taken again by the
- *	next first opener of its env, at the same key.
- */
-enum { MDB_SEM_ID = 2, MDB_SEM_N = 4 };
-
-/** EINVAL from a semop with SEM_UNDO on set \b semid: the set is gone, or
- *	it exists and this process has no undo entry left (kern.sysv.semume),
- *	#MDB_SEM_UNDO_FULL.
- */
-static int
-mdb_sem_einval(int semid)
-{
-	struct semid_ds buf;
-	union semun semu;
-	semu.buf = &buf;
-	return !semctl(semid, 0, IPC_STAT, semu) && buf.sem_nsems == MDB_SEM_N
-		? MDB_SEM_UNDO_FULL : EINVAL;
-}
-
 static int
 mdb_sem_wait(mdb_mutexref_t sem)
 {
@@ -509,7 +478,87 @@ mdb_sem_wait(mdb_mutexref_t sem)
 			break;
 		}
 	} while ((rc = errno) == EINTR);
-	return rc == EINVAL ? mdb_sem_einval(sem->semid) : rc;
+	return rc;
+}
+
+#define mdb_mutex_consistent(mutex)	0
+
+#elif defined MDB_USE_FCNTL
+	/** The locks a lock file carries: the reader table lock and the
+	 *	writer lock, each a mutex of this process and a POSIX record
+	 *	lock on one byte of the lock file, at #MDB_FCNTL_LOCKS on.
+	 *
+	 *	A record lock belongs to a process and a file: the kernel drops
+	 *	it when its holder dies, so a SIGKILLed writer never leaves the
+	 *	lock held, and nothing outlives the file (no semaphore, no name).
+	 *	But it does not exclude the threads of one process, and closing
+	 *	any descriptor of the file drops all of that process's locks on
+	 *	it. So a process opens a lock file once (#MDB_lockfile): every env
+	 *	of it in the process shares that descriptor, and the mutexes that
+	 *	exclude its threads and envs, until the last of them closes.
+	 */
+typedef struct MDB_lockfile {
+	struct MDB_lockfile *mf_next;	/**< the next lock file of this process */
+	dev_t		mf_dev;		/**< the lock file's device */
+	ino_t		mf_ino;		/**< the lock file's inode */
+	int			mf_fd;		/**< the descriptor every env of the lock file uses */
+	int			mf_refs;	/**< how many envs use it */
+	int			mf_nspare;	/**< how many descriptors in #mf_spare */
+	int			*mf_spare;	/**< descriptors closed only with #mf_fd */
+	pthread_mutex_t	mf_mutex[2];	/**< reader table lock, writer lock */
+} MDB_lockfile;
+
+	/** The first byte of the lock file locked as #mdb_mutex.%num.
+	 *	Past any pid, the bytes #mdb_reader_pid() locks.
+	 */
+#define MDB_FCNTL_LOCKS	0x40000000
+
+typedef struct mdb_mutex {
+	MDB_lockfile	*lf;	/**< the lock file, its descriptor and mutexes */
+	int		num;		/**< 0 the reader table lock, 1 the writer lock */
+	int		*locked;	/**< set while held, to tell a dead holder */
+} mdb_mutex_t[1], *mdb_mutexref_t;
+
+#define LOCK_MUTEX0(mutex)		mdb_flock_wait(mutex)
+#define UNLOCK_MUTEX(mutex)		mdb_flock_post(mutex)
+
+	/** Lock or unlock byte \b num of #MDB_FCNTL_LOCKS on \b fd. */
+static int
+mdb_flock(int fd, int cmd, short type, int num)
+{
+	int rc;
+	struct flock lock_info;
+	memset((void *)&lock_info, 0, sizeof(lock_info));
+	lock_info.l_type = type;
+	lock_info.l_whence = SEEK_SET;
+	lock_info.l_start = MDB_FCNTL_LOCKS + num;
+	lock_info.l_len = 1;
+	while ((rc = fcntl(fd, cmd, &lock_info)) && (rc = errno) == EINTR) ;
+	return rc;
+}
+
+static int
+mdb_flock_wait(mdb_mutexref_t mutex)
+{
+	int rc;
+	if ((rc = pthread_mutex_lock(&mutex->lf->mf_mutex[mutex->num])) != 0)
+		return rc;
+	if ((rc = mdb_flock(mutex->lf->mf_fd, F_SETLKW, F_WRLCK, mutex->num)) != 0) {
+		pthread_mutex_unlock(&mutex->lf->mf_mutex[mutex->num]);
+		return rc;
+	}
+	/* Still set: its last holder died holding it */
+	rc = *mutex->locked ? MDB_OWNERDEAD : MDB_SUCCESS;
+	*mutex->locked = 1;
+	return rc;
+}
+
+static void
+mdb_flock_post(mdb_mutexref_t mutex)
+{
+	*mutex->locked = 0;
+	mdb_flock(mutex->lf->mf_fd, F_SETLK, F_UNLCK, mutex->num);
+	pthread_mutex_unlock(&mutex->lf->mf_mutex[mutex->num]);
 }
 
 #define mdb_mutex_consistent(mutex)	0
@@ -563,7 +612,7 @@ typedef pthread_mutex_t *mdb_mutexref_t;
 #define	Yu	MDB_PRIy(u)	/**< printf format for #mdb_size_t */
 #define	Yd	MDB_PRIy(d)	/**< printf format for 'signed #mdb_size_t' */
 
-#ifdef MDB_USE_SYSV_SEM
+#if defined(MDB_USE_SYSV_SEM) || defined(MDB_USE_FCNTL)
 #define MNAME_LEN	(sizeof(int))
 #else
 #define MNAME_LEN	(sizeof(pthread_mutex_t))
@@ -957,6 +1006,9 @@ typedef struct MDB_txbody {
 #elif defined(MDB_USE_SYSV_SEM)
 	int 	mtb_semid;
 	int		mtb_rlocked;
+#elif defined(MDB_USE_FCNTL)
+		/** Set while the reader table lock is held */
+	int		mtb_rlocked;
 #else
 		/** Mutex protecting access to this table.
 		 *	This is the reader table lock used with LOCK_MUTEX().
@@ -977,13 +1029,15 @@ typedef struct MDB_txninfo {
 #define mti_mutexid	mt1.mtb.mtb_mutexid
 #ifdef MDB_USE_SYSV_SEM
 #define	mti_semid	mt1.mtb.mtb_semid
+#endif
+#if defined(MDB_USE_SYSV_SEM) || defined(MDB_USE_FCNTL)
 #define	mti_rlocked	mt1.mtb.mtb_rlocked
 #endif
 		char pad[(sizeof(MDB_txbody)+CACHELINE-1) & ~(CACHELINE-1)];
 	} mt1;
 #if !(defined(_WIN32) || defined(MDB_USE_POSIX_SEM))
 	union {
-#ifdef MDB_USE_SYSV_SEM
+#if defined(MDB_USE_SYSV_SEM) || defined(MDB_USE_FCNTL)
 		int mt2_wlocked;
 #define mti_wlocked	mt2.mt2_wlocked
 #else
@@ -1010,7 +1064,9 @@ typedef struct MDB_txninfo {
 #elif defined MDB_USE_POSIX_SEM
 # define MDB_LOCK_TYPE	(4 + ALIGNOF2(mdb_hash_t)/8 % 2)
 #elif defined MDB_USE_SYSV_SEM
-# define MDB_LOCK_TYPE	(7)	/* 7: four semaphores a set (MDB_SEM_N), keyed by the lock file's identity */
+# define MDB_LOCK_TYPE	(8)
+#elif defined MDB_USE_FCNTL
+# define MDB_LOCK_TYPE	(6)
 #elif defined MDB_USE_POSIX_MUTEX
 /* We do not know the inside of a POSIX mutex and how to check if mutexes
  * used by two executables are compatible. Just check alignment and size.
@@ -1967,7 +2023,6 @@ static char *const mdb_errstr[] = {
 	"MDB_ENV_BUSY: Environment is busy, can't use previous snapshot",
 	"MDB_IS_READONLY: Can't write in readonly txn or environment",
 	"MDB_ADDR_BUSY: Requested map address is unavailable",
-	"MDB_SEM_UNDO_FULL: SysV semaphore undo entries of this process full (kern.sysv.semume)",
 };
 
 char *
@@ -2678,22 +2733,48 @@ done:
 	return rc;
 }
 
-/** Find oldest txnid still referenced. Expects txn->mt_txnid > 0. */
+#if !(MDB_PIDLOCK)		/* Currently the same as defined(_WIN32) */
+enum Pidlock_op {
+	Pidset, Pidcheck
+};
+#else
+enum Pidlock_op {
+	Pidset = F_SETLK, Pidcheck = F_GETLK
+};
+#endif
+
+static int mdb_reader_pid(MDB_env *env, enum Pidlock_op op, MDB_PID_T pid);
+
+/** Find oldest txnid still referenced. Expects txn->mt_txnid > 0.
+ *	When that is a reader of another process that is dead, clear the
+ *	slots of dead processes and look again: a dead reader would keep
+ *	freed pages from reuse until something else cleared its slot.
+ */
 static txnid_t
 mdb_find_oldest(MDB_txn *txn)
 {
-	int i;
-	txnid_t mr, oldest = txn->mt_txnid - 1;
-	if (txn->mt_env->me_txns) {
-		MDB_reader *r = txn->mt_env->me_txns->mti_readers;
-		for (i = txn->mt_env->me_txns->mti_numreaders; --i >= 0; ) {
-			if (r[i].mr_pid) {
-				mr = r[i].mr_txnid;
-				if (oldest > mr)
-					oldest = mr;
+	int i, check = 1;
+	MDB_env *env = txn->mt_env;
+	MDB_PID_T pid;
+	txnid_t mr, oldest;
+	do {
+		oldest = txn->mt_txnid - 1;
+		pid = 0;
+		if (env->me_txns) {
+			MDB_reader *r = env->me_txns->mti_readers;
+			for (i = env->me_txns->mti_numreaders; --i >= 0; ) {
+				if (r[i].mr_pid) {
+					mr = r[i].mr_txnid;
+					if (oldest > mr) {
+						oldest = mr;
+						pid = r[i].mr_pid;
+					}
+				}
 			}
 		}
-	}
+	} while (pid && pid != env->me_pid && check-- &&
+		!mdb_reader_pid(env, Pidcheck, pid) &&
+		!mdb_reader_check0(env, 0, NULL));
 	return oldest;
 }
 
@@ -3268,16 +3349,6 @@ mdb_cursors_close(MDB_txn *txn, unsigned merge)
 	}
 }
 
-#if !(MDB_PIDLOCK)		/* Currently the same as defined(_WIN32) */
-enum Pidlock_op {
-	Pidset, Pidcheck
-};
-#else
-enum Pidlock_op {
-	Pidset = F_SETLK, Pidcheck = F_GETLK
-};
-#endif
-
 /** Set or check a pid lock. Set returns 0 on success.
  * Check returns 0 if the process is certainly dead, nonzero if it may
  * be alive (the lock exists or an error happened so we do not know).
@@ -3366,8 +3437,17 @@ mdb_txn_renew0(MDB_txn *txn)
 					if (ti->mti_readers[i].mr_pid == 0)
 						break;
 				if (i == env->me_maxreaders) {
-					UNLOCK_MUTEX(rmutex);
-					return MDB_READERS_FULL;
+					/* Full: free the slots of dead processes, and look again */
+					int dead;
+					if (!(rc = mdb_reader_check0(env, 1, &dead)) && dead) {
+						for (i=0; i<nr; i++)
+							if (ti->mti_readers[i].mr_pid == 0)
+								break;
+					}
+					if (i == env->me_maxreaders) {
+						UNLOCK_MUTEX(rmutex);
+						return rc ? rc : MDB_READERS_FULL;
+					}
 				}
 				r = &ti->mti_readers[i];
 				/* Claim the reader slot, carefully since other code
@@ -5978,99 +6058,150 @@ mdb_env_mname_init(MDB_env *env)
 
 #endif
 
-#ifdef MDB_USE_SYSV_SEM
-/** The lock file's identity, as two values a semaphore holds (1..32767), and
- *	the key its set is first looked for at, all from one hash of its inode and
- *	device.
- */
-static int ESECT
-mdb_sem_ident(MDB_env *env, int id[2], key_t *key)
+#ifdef MDB_USE_FCNTL
+	/** This process's lock files, each opened once (#MDB_lockfile) */
+static MDB_lockfile *mdb_lockfiles;
+	/** Guards #mdb_lockfiles, and is held through an env's open while
+	 *	it may hold its lock file exclusively, so another env of the same
+	 *	lock file in this process never sees its lock region half made.
+	 */
+static pthread_mutex_t mdb_lockfiles_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t mdb_lockfiles_once = PTHREAD_ONCE_INIT;
+
+static void mdb_lockfiles_prepare(void) { pthread_mutex_lock(&mdb_lockfiles_mutex); }
+static void mdb_lockfiles_parent(void) { pthread_mutex_unlock(&mdb_lockfiles_mutex); }
+	/** A child of fork() holds none of its parent's record locks, and
+	 *	closing a descriptor it inherited would drop the locks it takes on
+	 *	that file itself. So it forgets its parent's lock files, never
+	 *	closing them: an env it opens opens its lock file again.
+	 */
+static void mdb_lockfiles_child(void)
 {
+	mdb_lockfiles = NULL;
+	pthread_mutex_unlock(&mdb_lockfiles_mutex);
+}
+static void mdb_lockfiles_init(void)
+{
+	pthread_atfork(mdb_lockfiles_prepare, mdb_lockfiles_parent, mdb_lockfiles_child);
+}
+
+	/** Take this process's #MDB_lockfile for the env's lock file, opening
+	 *	the file only when no env of this process has it open. Caller holds
+	 *	#mdb_lockfiles_mutex.
+	 * @param[in,out] excl -1 in; out 0 when another env of this process
+	 *	uses the lock file, which this process then holds shared already
+	 * @return 0 on success, non-zero on failure.
+	 */
+static int ESECT
+mdb_lockfile_open(MDB_env *env, MDB_name *fname, int mode, int *excl)
+{
+	MDB_lockfile *lf;
 	struct stat st;
-	uint64_t h;
-	if (fstat(env->me_lfd, &st))
-		return ErrCode();
-	h = ((uint64_t)st.st_ino ^ ((uint64_t)st.st_dev << 40)) * 0x9E3779B97F4A7C15ULL;
-	id[0] = 1 + (int)((h >> 34) % 32767);
-	id[1] = 1 + (int)((h >> 49) % 32767);
-	*key = (key_t)((h & 0x7fffffff) | 1);	/* positive, never IPC_PRIVATE */
+	int fd, rc, *sp;
+
+	if (fname->mn_alloced)
+		mdb_name_cpy(fname->mn_val + fname->mn_len,
+			mdb_suffixes[1][F_ISSET(env->me_flags, MDB_NOSUBDIR)]);
+	fd = INVALID_HANDLE_VALUE;
+	if (!stat(fname->mn_val, &st)) {
+		for (lf = mdb_lockfiles; lf; lf = lf->mf_next)
+			if (lf->mf_dev == st.st_dev && lf->mf_ino == st.st_ino)
+				goto joined;
+	}
+	if ((rc = mdb_fopen(env, fname, MDB_O_LOCKS, mode, &fd)) != 0)
+		return rc;
+	if (fstat(fd, &st)) {
+		rc = ErrCode();
+		close(fd);
+		return rc;
+	}
+	for (lf = mdb_lockfiles; lf; lf = lf->mf_next)
+		if (lf->mf_dev == st.st_dev && lf->mf_ino == st.st_ino) {
+			/* The path named another file a moment ago: this one is open
+			 * already, and closing fd would drop its locks. Keep fd open
+			 * until the lock file is closed.
+			 */
+			if (!(sp = realloc(lf->mf_spare, (lf->mf_nspare+1) * sizeof(int))))
+				return ENOMEM;	/* fd stays open, unused */
+			sp[lf->mf_nspare++] = fd;
+			lf->mf_spare = sp;
+			goto joined;
+		}
+	if (!(lf = calloc(1, sizeof(MDB_lockfile)))) {
+		close(fd);
+		return ENOMEM;
+	}
+	if ((rc = pthread_mutex_init(&lf->mf_mutex[0], NULL)) != 0) {
+		free(lf);
+		close(fd);
+		return rc;
+	}
+	if ((rc = pthread_mutex_init(&lf->mf_mutex[1], NULL)) != 0) {
+		pthread_mutex_destroy(&lf->mf_mutex[0]);
+		free(lf);
+		close(fd);
+		return rc;
+	}
+	lf->mf_dev = st.st_dev;
+	lf->mf_ino = st.st_ino;
+	lf->mf_fd = fd;
+	lf->mf_next = mdb_lockfiles;
+	mdb_lockfiles = lf;
+	lf->mf_refs = 1;
+	env->me_lfd = fd;
+	env->me_rmutex->lf = env->me_wmutex->lf = lf;
+	return mdb_env_excl_lock(env, excl);
+
+joined:
+	lf->mf_refs++;
+	env->me_lfd = lf->mf_fd;
+	env->me_rmutex->lf = env->me_wmutex->lf = lf;
+	*excl = 0;
 	return MDB_SUCCESS;
 }
 
-/** Does set \b semid name lock file \b id? */
+	/** Does another env of this process use the env's lock file? */
 static int ESECT
-mdb_sem_ours(int semid, int id[2])
+mdb_lockfile_shared(MDB_env *env)
 {
-	return semctl(semid, MDB_SEM_ID, GETVAL) == id[0] &&
-		semctl(semid, MDB_SEM_ID+1, GETVAL) == id[1];
+	int shared;
+	pthread_mutex_lock(&mdb_lockfiles_mutex);
+	shared = env->me_rmutex->lf && env->me_rmutex->lf->mf_refs > 1;
+	pthread_mutex_unlock(&mdb_lockfiles_mutex);
+	return shared;
 }
 
-/** The set of lock file \b id, from \b key on: a new set is claimed in one
- *	semop (its identity written and its locks made free together, only while
- *	it names no lock file, so two openers never both claim one), a set naming
- *	this lock file is the one to use, and a set naming another, or of another
- *	layout, is passed over. With \b reset (the first opener, holding the lock
- *	file exclusively, so no process uses the set) a set found already naming
- *	this lock file has its locks made free: one its dead last user left.
- *	No SEM_UNDO: nothing here is the process's to give back.
- */
-static int ESECT
-mdb_sem_take(key_t key, int mode, int id[2], int reset, int *semid)
+	/** Give back the env's #MDB_lockfile: the last env of this process to
+	 *	use it closes the lock file, which drops this process's locks on it.
+	 *	An env this process inherited through fork() leaves it alone.
+	 */
+static void ESECT
+mdb_lockfile_close(MDB_env *env)
 {
-	/* five operations, macOS's most in one semop (SEMOPM, 5); the two
-	 * identity values are only ever written together, here, so the first
-	 * being zero says the set names no lock file */
-	struct sembuf claim[5] = {
-		{ MDB_SEM_ID, 0, IPC_NOWAIT },
-		{ MDB_SEM_ID, 0, IPC_NOWAIT }, { MDB_SEM_ID+1, 0, IPC_NOWAIT },
-		{ 0, 1, IPC_NOWAIT }, { 1, 1, IPC_NOWAIT } };
-	struct semid_ds buf;
-	union semun semu;
-	int i, s, rc, gone = 0;
-	claim[1].sem_op = id[0];
-	claim[2].sem_op = id[1];
-	for (i = 0; i <= 0xffff; i++, key = (key_t)(((key + 2) & 0x7fffffff) | 1)) {
-again:
-		s = semget(key, MDB_SEM_N, (mode & 0777) | IPC_CREAT);
-		if (s < 0) {
-			if ((rc = ErrCode()) == EINVAL || rc == EACCES)
-				continue;	/* a set of another size, or another user's, at this key */
-			return rc;
-		}
-		semu.buf = &buf;
-		if (semctl(s, 0, IPC_STAT, semu) < 0) {
-			if (gone++ < 8)
-				goto again;	/* removed under us: this key again */
-			continue;
-		}
-		if (buf.sem_nsems != MDB_SEM_N)
-			continue;
-		while ((rc = semop(s, claim, 5)) && (rc = ErrCode()) == EINTR) ;
-		if (!rc) {
-			*semid = s;
-			return MDB_SUCCESS;
-		}
-		if ((rc == EINVAL || rc == EIDRM) && gone++ < 8)
-			goto again;	/* removed under us (its last user's close): this key again */
-		if (rc == EINVAL || rc == EIDRM || rc == EACCES || rc == ERANGE)
-			continue;	/* another user's, or a foreign set whose locks are past their range */
-		if (rc != EAGAIN)
-			return rc;
-		if (!mdb_sem_ours(s, id))
-			continue;	/* another lock file's */
-		if (reset) {
-			semu.val = 1;
-			if (semctl(s, 0, SETVAL, semu) < 0 || semctl(s, 1, SETVAL, semu) < 0)
-				return ErrCode();
-		}
-		*semid = s;
-		return MDB_SUCCESS;
+	MDB_lockfile *lf = env->me_rmutex->lf, **lp;
+	int i;
+
+	if (!lf || env->me_pid != getpid())
+		return;
+	pthread_mutex_lock(&mdb_lockfiles_mutex);
+	if (--lf->mf_refs == 0) {
+		for (lp = &mdb_lockfiles; *lp; lp = &(*lp)->mf_next)
+			if (*lp == lf) {
+				*lp = lf->mf_next;
+				break;
+			}
+		for (i = 0; i < lf->mf_nspare; i++)
+			(void) close(lf->mf_spare[i]);
+		(void) close(lf->mf_fd);
+		pthread_mutex_destroy(&lf->mf_mutex[0]);
+		pthread_mutex_destroy(&lf->mf_mutex[1]);
+		free(lf->mf_spare);
+		free(lf);
 	}
-	return ENOSPC;	/* every key's set is another lock file's */
-	/* A foreign set of four semaphores whose third is zero is taken as new:
-	 * nothing but its layout and identity says whose a set is. */
+	pthread_mutex_unlock(&mdb_lockfiles_mutex);
+	env->me_rmutex->lf = env->me_wmutex->lf = NULL;
 }
-#endif	/* MDB_USE_SYSV_SEM */
+#endif	/* MDB_USE_FCNTL */
 
 /** Open and/or initialize the lock region for the environment.
  * @param[in] env The LMDB environment.
@@ -6088,14 +6219,17 @@ mdb_env_setup_locks(MDB_env *env, MDB_name *fname, int mode, int *excl)
 #	define MDB_ERRCODE_ROFS	EROFS
 #endif
 #ifdef MDB_USE_SYSV_SEM
-	int semid, id[2];
-	key_t key;
+	int semid;
 	union semun semu;
 #endif
 	int rc;
 	MDB_OFF_T size, rsize;
 
+#ifdef MDB_USE_FCNTL
+	rc = mdb_lockfile_open(env, fname, mode, excl);
+#else
 	rc = mdb_fopen(env, fname, MDB_O_LOCKS, mode, &env->me_lfd);
+#endif
 	if (rc) {
 		/* Omit lockfile if read-only env on read-only filesystem */
 		if (rc == MDB_ERRCODE_ROFS && (env->me_flags & MDB_RDONLY)) {
@@ -6119,10 +6253,12 @@ mdb_env_setup_locks(MDB_env *env, MDB_name *fname, int mode, int *excl)
 #endif
 	}
 
+#ifndef MDB_USE_FCNTL	/* mdb_lockfile_open() did it */
 	/* Try to get exclusive lock. If we succeed, then
 	 * nobody is using the lock region and we should initialize it.
 	 */
 	if ((rc = mdb_env_excl_lock(env, excl))) goto fail;
+#endif
 
 #ifdef _WIN32
 	size = GetFileSize(env->me_lfd, NULL);
@@ -6221,16 +6357,20 @@ mdb_env_setup_locks(MDB_env *env, MDB_name *fname, int mode, int *excl)
 		env->me_wmutex = sem_open(MUTEXNAME(env, 'w'), O_CREAT|O_EXCL, mode, 1);
 		if (env->me_wmutex == SEM_FAILED) goto fail_errno;
 #elif defined(MDB_USE_SYSV_SEM)
-		if ((rc = mdb_sem_ident(env, id, &key)) ||
-			(rc = mdb_sem_take(key, mode, id, 1, &semid)))
-			goto fail;
-		/* the set a dead last user published, when it is ours at a later key
-		 * than the one taken now (its key's set was another's then): nobody
-		 * else will remove it */
-		if (env->me_txns->mti_semid != semid && env->me_txns->mti_semid > 0 &&
-			mdb_sem_ours(env->me_txns->mti_semid, id))
-			semctl(env->me_txns->mti_semid, 0, IPC_RMID);
+		unsigned short vals[2] = {1, 1};
+		key_t key = ftok(fname->mn_val, 'M'); /* fname is lockfile path now */
+		if (key == -1)
+			goto fail_errno;
+		semid = semget(key, 2, (mode & 0777) | IPC_CREAT);
+		if (semid < 0)
+			goto fail_errno;
+		semu.array = vals;
+		if (semctl(semid, 0, SETALL, semu) < 0)
+			goto fail_errno;
 		env->me_txns->mti_semid = semid;
+		env->me_txns->mti_rlocked = 0;
+		env->me_txns->mti_wlocked = 0;
+#elif defined(MDB_USE_FCNTL)
 		env->me_txns->mti_rlocked = 0;
 		env->me_txns->mti_wlocked = 0;
 #else	/* MDB_USE_POSIX_MUTEX: */
@@ -6289,37 +6429,14 @@ mdb_env_setup_locks(MDB_env *env, MDB_name *fname, int mode, int *excl)
 		env->me_wmutex = sem_open(MUTEXNAME(env, 'w'), 0);
 		if (env->me_wmutex == SEM_FAILED) goto fail_errno;
 #elif defined(MDB_USE_SYSV_SEM)
-		if ((rc = mdb_sem_ident(env, id, &key)))
-			goto fail;
-		for (;;) {
-			int s;
-			semid = env->me_txns->mti_semid;
-			if (semid != -1 && mdb_sem_ours(semid, id))
-				break;
-			/* The set is gone: its last user removed it (a close that ran
-			 * while this process waited for the lock file), or it is not
-			 * ours. Take this lock file's set and publish it in the lock
-			 * file, unless another process waiting with us published one
-			 * first (the same set: it is found by the same key).
-			 */
-			if ((rc = mdb_sem_take(key, mode, id, 0, &s)))
-				goto fail;
-			if (__sync_bool_compare_and_swap(&env->me_txns->mti_semid, semid, s)) {
-				semid = s;
-				break;
-			}
-			/* another joiner published first: a set of ours it did not publish
-			 * is used by nobody (it was never in the lock file) */
-			if (env->me_txns->mti_semid != s)
-				semctl(s, 0, IPC_RMID);
-		}
+		semid = env->me_txns->mti_semid;
 		semu.buf = &buf;
-		/* check for read access, then for write access */
-		if (semctl(semid, 0, IPC_STAT, semu) < 0 ||
-			semctl(semid, 0, IPC_SET, semu) < 0) {
-			rc = ErrCode();
-			goto fail;
-		}
+		/* check for read access */
+		if (semctl(semid, 0, IPC_STAT, semu) < 0)
+			goto fail_errno;
+		/* check for write access */
+		if (semctl(semid, 0, IPC_SET, semu) < 0)
+			goto fail_errno;
 #endif
 	}
 #ifdef MDB_USE_SYSV_SEM
@@ -6327,6 +6444,11 @@ mdb_env_setup_locks(MDB_env *env, MDB_name *fname, int mode, int *excl)
 	env->me_wmutex->semid = semid;
 	env->me_rmutex->semnum = 0;
 	env->me_wmutex->semnum = 1;
+	env->me_rmutex->locked = &env->me_txns->mti_rlocked;
+	env->me_wmutex->locked = &env->me_txns->mti_wlocked;
+#elif defined(MDB_USE_FCNTL)
+	env->me_rmutex->num = 0;
+	env->me_wmutex->num = 1;
 	env->me_rmutex->locked = &env->me_txns->mti_rlocked;
 	env->me_wmutex->locked = &env->me_txns->mti_wlocked;
 #endif
@@ -6416,6 +6538,9 @@ int ESECT
 mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode)
 {
 	int rc, excl = -1;
+#ifdef MDB_USE_FCNTL
+	int lockfiles = 0;	/* holding #mdb_lockfiles_mutex */
+#endif
 	MDB_name fname;
 
 	if (env->me_fd!=INVALID_HANDLE_VALUE || (flags & ~(CHANGEABLE|CHANGELESS)))
@@ -6509,6 +6634,13 @@ mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode
 	}
 	env->me_dbxs[FREE_DBI].md_cmp = mdb_cmp_long; /* aligned MDB_INTEGERKEY */
 
+#ifdef MDB_USE_FCNTL
+	if (!(flags & MDB_NOLOCK)) {
+		pthread_once(&mdb_lockfiles_once, mdb_lockfiles_init);
+		pthread_mutex_lock(&mdb_lockfiles_mutex);
+		lockfiles = 1;
+	}
+#endif
 	/* For RDONLY, get lockfile after we know datafile exists */
 	if (!(flags & (MDB_RDONLY|MDB_NOLOCK))) {
 		rc = mdb_env_setup_locks(env, &fname, mode, &excl);
@@ -6593,6 +6725,10 @@ mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode
 
 leave:
 	MDB_TRACE(("%p, %s, %u, %04o", env, path, flags & (CHANGEABLE|CHANGELESS), mode));
+#ifdef MDB_USE_FCNTL
+	if (lockfiles)
+		pthread_mutex_unlock(&mdb_lockfiles_mutex);
+#endif
 	if (rc) {
 		mdb_env_close_active(env, excl);
 	}
@@ -6685,6 +6821,15 @@ mdb_env_close_active(MDB_env *env, int excl)
 		 * data owned by this process (me_close_readers and
 		 * our readers), and clear each reader atomically.
 		 */
+#ifdef MDB_USE_FCNTL
+		/* Every env of the lock file in this process registers its
+		 * readers with this pid: only the last of them clears them, and
+		 * an env inherited through fork() clears none (they would be
+		 * the child's own). With #MDB_NOTLS an env's slots are free
+		 * once its read transactions have ended.
+		 */
+		if (env->me_pid == pid && !mdb_lockfile_shared(env))
+#endif
 		for (i = env->me_close_readers; --i >= 0; )
 			if (env->me_txns->mti_readers[i].mr_pid == pid)
 				env->me_txns->mti_readers[i].mr_pid = 0;
@@ -6712,30 +6857,21 @@ mdb_env_close_active(MDB_env *env, int excl)
 			}
 		}
 #elif defined(MDB_USE_SYSV_SEM)
-		if (env->me_rmutex->semid != -1 && env->me_pid == getpid()) {
+		if (env->me_rmutex->semid != -1) {
 			/* If we have the filelock:  If we are the
-			 * only remaining user, clean up semaphores,
-			 * and say so in the lock file for a process
-			 * already waiting for the lock.
+			 * only remaining user, clean up semaphores.
 			 */
 			if (excl == 0)
 				mdb_env_excl_lock(env, &excl);
-			if (excl > 0) {
-				/* and the set the lock file names now, when it is ours and
-				 * not the one this process opened with (a joiner published it
-				 * after this process's set was removed under it) */
-				int pub = env->me_txns->mti_semid, id[2];
-				key_t key;
-				env->me_txns->mti_semid = -1;
+			if (excl > 0)
 				semctl(env->me_rmutex->semid, 0, IPC_RMID);
-				if (pub > 0 && pub != env->me_rmutex->semid &&
-					!mdb_sem_ident(env, id, &key) && mdb_sem_ours(pub, id))
-					semctl(pub, 0, IPC_RMID);
-			}
 		}
 #endif
 		munmap((void *)env->me_txns, (env->me_maxreaders-1)*sizeof(MDB_reader)+sizeof(MDB_txninfo));
 	}
+#ifdef MDB_USE_FCNTL
+	mdb_lockfile_close(env);
+#else
 	if (env->me_lfd != INVALID_HANDLE_VALUE) {
 #ifdef _WIN32
 		if (excl >= 0) {
@@ -6747,6 +6883,7 @@ mdb_env_close_active(MDB_env *env, int excl)
 #endif
 		(void) close(env->me_lfd);
 	}
+#endif
 #if MDB_RPAGE_CACHE
 	if (MDB_REMAPPING(env->me_flags))
 	{

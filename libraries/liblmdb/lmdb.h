@@ -57,7 +57,8 @@
  *	  #mdb_reader_check function or the \ref mdb_stat_1 "mdb_stat" tool.
  *	  Stale writers will be cleared automatically on most systems:
  *	  - Windows - automatic
- *	  - BSD, systems using SysV semaphores - automatic
+ *	  - BSD, macOS with MDB_USE_ROBUST, systems using fcntl locks or
+ *	    SysV semaphores - automatic
  *	  - Linux, systems using POSIX mutexes with Robust option - automatic
  *	  Otherwise just make all programs using the database close it;
  *	  the lockfile is always reset on first open of the environment.
@@ -105,6 +106,11 @@
  *	  the same time.  Not even from a plain open() call - close()ing it
  *	  breaks fcntl() advisory locking.  (It is OK to reopen it after
  *	  fork() - exec*(), since the lockfile has FD_CLOEXEC set.)
+ *	  With fcntl locks (MDB_USE_FCNTL, the default on BSD and on macOS
+ *	  with MDB_USE_ROBUST) a process may open an environment twice, and
+ *	  a child of fork() may open its own: the library keeps one
+ *	  descriptor of each lock file per process.  A plain open() and
+ *	  close() of the lock file still breaks the locks.
  *
  *	- Avoid long-lived transactions.  Read transactions prevent
  *	  reuse of pages freed by newer write transactions, thus the
@@ -540,10 +546,8 @@ typedef enum MDB_cursor_op {
 #define MDB_IS_READONLY	(-30770)
 	/** Requested map address is unavailable */
 #define MDB_ADDR_BUSY	(-30769)
-	/** SysV semaphore undo entries of this process full (kern.sysv.semume) */
-#define MDB_SEM_UNDO_FULL	(-30768)
 	/** The last defined error code */
-#define MDB_LAST_ERRCODE	MDB_SEM_UNDO_FULL
+#define MDB_LAST_ERRCODE	MDB_ADDR_BUSY
 /** @} */
 
 /** @brief Statistics for a database in the environment */
