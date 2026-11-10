@@ -356,6 +356,8 @@ typedef void (MDB_sum_func)(const MDB_val *src, MDB_val *dst, const MDB_val *key
 #define MDB_ENCRYPT		0x2000U
 	/** no environment directory */
 #define MDB_NOSUBDIR	0x4000
+	/** don't fsync after commit; a system crash rolls back to the last #mdb_env_sync() */
+#define MDB_SAFENOSYNC	0x8000
 	/** don't fsync after commit */
 #define MDB_NOSYNC		0x10000
 	/** read only */
@@ -546,8 +548,10 @@ typedef enum MDB_cursor_op {
 #define MDB_IS_READONLY	(-30770)
 	/** Requested map address is unavailable */
 #define MDB_ADDR_BUSY	(-30769)
+	/** Environment needs a writable exclusive open after a system crash (#MDB_SAFENOSYNC) */
+#define MDB_UNSETTLED	(-30768)
 	/** The last defined error code */
-#define MDB_LAST_ERRCODE	MDB_ADDR_BUSY
+#define MDB_LAST_ERRCODE	MDB_UNSETTLED
 /** @} */
 
 /** @brief Statistics for a database in the environment */
@@ -665,6 +669,33 @@ int  mdb_env_create(MDB_env **env);
 	 *		hint for when to write transactions to disk, unless #mdb_env_sync()
 	 *		is called. (#MDB_MAPASYNC | #MDB_WRITEMAP) may be preferable.
 	 *		This flag may be changed at any time using #mdb_env_set_flags().
+	 *	<li>#MDB_SAFENOSYNC
+	 *		Don't flush system buffers to disk when committing a transaction,
+	 *		as #MDB_NOSYNC, but keep the snapshot the last #mdb_env_sync()
+	 *		made durable (the steady snapshot) whole: its pages are not reused
+	 *		until the next #mdb_env_sync() has made a newer one durable, and
+	 *		the meta pages record it. After a system crash the first process
+	 *		to open the environment for writing, alone, finds that the system
+	 *		has booted since and rolls the environment back to the steady
+	 *		snapshot: the transactions committed after the last
+	 *		#mdb_env_sync() are lost, the database is never corrupted.
+	 *		A process that is killed loses nothing (the system keeps its
+	 *		writes). The cost is what a long-lived reader at the steady
+	 *		snapshot costs: the pages freed since it are not reused until the
+	 *		next sync. #mdb_env_sync() orders the writes before it ahead of
+	 *		its record of the snapshot (F_BARRIERFSYNC where there is one,
+	 *		else a flush) and then flushes. Once an environment has been
+	 *		synced so, every writer of it keeps the steady snapshot, with or
+	 *		without this flag. Until a process opening it for writing, alone,
+	 *		has rolled it back, an environment the system crashed under is
+	 *		unsettled: every other open of it fails with #MDB_UNSETTLED (a
+	 *		read-only one, one with #MDB_PREVSNAPSHOT, one while another
+	 *		process has it open). A process that waits on the lock file while
+	 *		that writer opens it finds it settled. Where the system's boot
+	 *		cannot be identified (systems other than macOS and Linux) a kill
+	 *		cannot be told from a crash, and opening with this flag, or an
+	 *		environment that was synced with it, fails with EINVAL. Not with
+	 *		#MDB_WRITEMAP, nor on Windows; a page size of at least 1024.
 	 *	<li>#MDB_MAPASYNC
 	 *		When using #MDB_WRITEMAP, use asynchronous flushes to disk.
 	 *		As with #MDB_NOSYNC, a system crash can then corrupt the
@@ -727,6 +758,9 @@ int  mdb_env_create(MDB_env **env);
 	 *	<li>#MDB_VERSION_MISMATCH - the version of the LMDB library doesn't match the
 	 *	version that created the database environment.
 	 *	<li>#MDB_INVALID - the environment file headers are corrupted.
+	 *	<li>#MDB_UNSETTLED - the environment was kept with #MDB_SAFENOSYNC, the
+	 *	system crashed since, and this open cannot roll it back: open it for
+	 *	writing, with no other process using it, first.
 	 *	<li>ENOENT - the directory specified by the path parameter doesn't exist.
 	 *	<li>EACCES - the user didn't have permission to access the environment files.
 	 *	<li>EAGAIN - the environment was locked by another process.
@@ -881,6 +915,8 @@ int  mdb_env_info(MDB_env *env, MDB_envinfo *stat);
 	 * the OS buffers upon commit as well, unless the environment was
 	 * opened with #MDB_NOSYNC or in part #MDB_NOMETASYNC. This call is
 	 * not valid if the environment was opened with #MDB_RDONLY.
+	 * With #MDB_SAFENOSYNC a forced flush also makes the latest snapshot
+	 * the steady one, which a system crash rolls back to.
 	 * @param[in] env An environment handle returned by #mdb_env_create()
 	 * @param[in] force If non-zero, force a synchronous flush.  Otherwise
 	 *  if the environment has the #MDB_NOSYNC flag set the flushes
