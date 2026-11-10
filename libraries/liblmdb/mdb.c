@@ -2087,6 +2087,7 @@ static char *const mdb_errstr[] = {
 	"MDB_IS_READONLY: Can't write in readonly txn or environment",
 	"MDB_ADDR_BUSY: Requested map address is unavailable",
 	"MDB_UNSETTLED: Environment needs a writable exclusive open after a system crash",
+	"MDB_ENV_FORKED: Environment was inherited across fork()",
 };
 
 char *
@@ -3926,6 +3927,8 @@ mdb_txn_renew(MDB_txn *txn)
 
 	if (!txn || !F_ISSET(txn->mt_flags, MDB_TXN_RDONLY|MDB_TXN_FINISHED))
 		return EINVAL;
+	if (txn->mt_env->me_pid != getpid())
+		return MDB_ENV_FORKED;
 
 	rc = mdb_txn_renew0(txn);
 	if (rc == MDB_SUCCESS) {
@@ -3973,6 +3976,8 @@ mdb_txn_begin(MDB_env *env, MDB_txn *parent, unsigned int flags, MDB_txn **ret)
 	flags &= MDB_TXN_BEGIN_FLAGS;
 	flags |= env->me_flags & MDB_WRITEMAP;
 
+	if (env->me_pid != getpid())	/* inherited across fork() */
+		return MDB_ENV_FORKED;
 	if (env->me_flags & MDB_RDONLY & ~flags) /* write txn in RDONLY env */
 		return MDB_IS_READONLY;
 
@@ -6998,6 +7003,7 @@ mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode
 
 	if (env->me_fd!=INVALID_HANDLE_VALUE || (flags & ~(CHANGEABLE|CHANGELESS)))
 		return EINVAL;
+	env->me_pid = getpid();	/* the process that opens it, which alone may use it */
 
 	if ((rc = mdb_env_envflags(env)) != MDB_SUCCESS)
 		return rc;

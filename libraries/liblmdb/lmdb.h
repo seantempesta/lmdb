@@ -101,6 +101,13 @@
  *	  The #MDB_NOTLS flag changes this for read-only transactions.
  *
  *	- Use an MDB_env* in the process which opened it, not after fork().
+ *	  A transaction begun or renewed through an environment the process
+ *	  inherited across fork() fails with #MDB_ENV_FORKED: its readers
+ *	  would be registered under the parent's process ID, and cleared as
+ *	  a dead process's when the parent exits.  On an inherited
+ *	  environment the child may call only #mdb_env_get_path() and
+ *	  #mdb_env_close(), which leaves the parent's locks and readers alone;
+ *	  it opens an environment of its own to use the database.
  *
  *	- Do not have open an LMDB database twice in the same process at
  *	  the same time.  Not even from a plain open() call - close()ing it
@@ -550,8 +557,10 @@ typedef enum MDB_cursor_op {
 #define MDB_ADDR_BUSY	(-30769)
 	/** Environment needs a writable exclusive open after a system crash (#MDB_SAFENOSYNC) */
 #define MDB_UNSETTLED	(-30768)
+	/** Environment was inherited across fork(): open one in this process */
+#define MDB_ENV_FORKED	(-30767)
 	/** The last defined error code */
-#define MDB_LAST_ERRCODE	MDB_UNSETTLED
+#define MDB_LAST_ERRCODE	MDB_ENV_FORKED
 /** @} */
 
 /** @brief Statistics for a database in the environment */
